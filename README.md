@@ -797,9 +797,11 @@ keep up with — widen the spacing, or use a faster body for the dense sections.
 
 ### Per-run CSV report
 
-When the application closes, a report named `<timestamp>.shots.csv` is written next to the
-log file `<timestamp>.log` (the timestamp is the start time of the run). It contains one row
-per scheduled shot:
+When you stop the scheduler (the **Stop** button) or close the application, a report named
+`<timestamp>.shots.csv` is written to `/tmp`,
+alongside the application log `/tmp/solareclipseworkbench.log` (the timestamp is the start
+time of the run, so reports from different runs do not overwrite each other). It contains
+one row per scheduled shot:
 
 | Column | Meaning |
 | ------ | ------- |

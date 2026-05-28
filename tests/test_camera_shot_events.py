@@ -90,6 +90,23 @@ def test_wrapper_publishes_failed_and_reraises():
     assert cam._usb_lock.released == 1  # released even on failure
 
 
+def test_event_camera_name_comes_from_settings_not_object():
+    # The live camera object's name (gphoto2 model, with suffix) differs from the script
+    # name in CameraSettings; the event must carry the script name so it matches the table.
+    events = _collect("take_picture")
+
+    @_serialised_on_camera
+    def take_picture(camera, settings):
+        return "ok"
+
+    cam = _FakeCamera(name="Canon EOS 1100D (PTP mode)")
+    settings = CameraSettings("1100D", "1/2000", "5.6", 100)
+    take_picture(cam, settings)
+
+    assert len(events) == 1
+    assert events[0].camera_name == "1100D"
+
+
 def test_describe_args_capture_and_fallback():
     s = CameraSettings("cam0", "1/2000", "5.6", 100)
     assert _describe_args("take_picture", (s,), {}) == f"1/2000, {s.aperture}, 100"

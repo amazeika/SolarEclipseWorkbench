@@ -267,17 +267,22 @@ Steps:
 
 ### Phase 4: CSV post-run report
 
-**Goal:** `*.shots.csv` next to the run log at shutdown.
+**Goal:** `*.shots.csv` next to the application log at shutdown.
 
 Steps:
 1. Add `ShotLog` (own module or on the view) — lock-guarded event list + `write_csv(path)`
    using stdlib `csv` and the schema above.
 2. The bridge slot appends every event to `ShotLog`.
-3. Derive the CSV path from the run-log stem set in [gui.py:2727](../../src/solareclipseworkbench/gui.py#L2727)
-   (`{time_string}.log` → `{time_string}.shots.csv`). **Note:** this stem lives in
-   `gui.py`'s `main()`, not `camera.py` as the source brief stated — see Open Questions.
-4. Write from `SolarEclipseView.closeEvent` ([gui.py:882](../../src/solareclipseworkbench/gui.py#L882)),
-   plus an `atexit` handler so non-GUI runs still produce a CSV.
+3. Write the CSV alongside the application log. The intended `{time_string}.log` in
+   `gui.main()` is never actually created — a module-level `logging.basicConfig` at import
+   (`gui.py:73`, `filename="/tmp/solareclipseworkbench.log"`) configures the root logger
+   first, so `main()`'s second `basicConfig` is a no-op. The real log is therefore
+   `/tmp/solareclipseworkbench.log`; the report is written next to it as
+   `/tmp/{time_string}.shots.csv` via `shot_log.set_run_basename`.
+4. Write on scheduler shutdown (the **Stop** toolbar action, `on_toolbar_button_click`) and
+   from `SolarEclipseView.closeEvent`, plus an `atexit` handler as a backstop. Writing on
+   Stop matters because the scheduler is commonly stopped while the window stays open — the
+   close/atexit hooks alone would not produce a report until the app exits.
 
 ### Phase 5: Integration test
 
@@ -344,10 +349,12 @@ indicator and the CSV report.
 
 ## 5. Open Questions
 
-- **~~Log-path location.~~** *Resolved (Phase 4).* The run stem comes from `gui.main()`'s
-  `time_string`; a module-level holder in `shot_log.py` (`set_run_basename`) is set there,
-  and the report is written to `{time_string}.shots.csv`. (The brief wrongly placed the log
-  filename in `camera.py`; it is in `gui.py main()`.)
+- **~~Log-path location.~~** *Resolved (Phase 4, revised after a live run).* The report is
+  written to `/tmp/{time_string}.shots.csv`, next to the application log
+  `/tmp/solareclipseworkbench.log`. The brief wrongly placed the log filename in
+  `camera.py`; it is in `gui.main()` — but that `{time_string}.log` is never created either,
+  because a module-level `basicConfig` at import (`gui.py:73`) already configured the root
+  logger to `/tmp`, making `main()`'s call a no-op. So "next to the log" means `/tmp`.
 - **~~Headless entry point.~~** *Resolved (Phase 4).* There is no separate non-GUI scheduler
   entry — `gui.main()` is the only entry and runs the scheduler inside the GUI app. So
   `SolarEclipseView.closeEvent` is the primary write path; the `atexit` handler in
@@ -372,8 +379,12 @@ as designed — Qt-free `ShotEventBus`, camera instrumentation, GUI status bar +
 highlight, and a per-run CSV — with these deviations from the original brief:
 
 - **Log-path location.** The brief placed the run-log filename in `camera.py:main`; it is
-  actually in `gui.py main()` (`{time_string}.log`). The CSV stem is derived there via
-  `shot_log.set_run_basename(time_string)`, not by promoting a helper into `camera.py`.
+  actually in `gui.main()`. A live run revealed that `{time_string}.log` is never created —
+  a module-level `basicConfig` at `gui.py:73` configures the root logger to
+  `/tmp/solareclipseworkbench.log` at import, so `main()`'s `basicConfig` is a no-op. The
+  report is therefore written to `/tmp/{time_string}.shots.csv` (next to that log) via
+  `shot_log.set_run_basename`. Fixing the dead `{time_string}.log` config is out of scope
+  (would change where logs land); left as-is.
 - **`ShotLog` placement.** Rather than living on the view, `ShotLog` is a module-level
   self-subscribing singleton (`shot_log.LOG`) plus an `atexit` backstop, so the report is
   recorded independently of the GUI. The view only triggers the write in `closeEvent`.

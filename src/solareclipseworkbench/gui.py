@@ -467,8 +467,10 @@ class SolarEclipseView(QMainWindow, Observable):
     def _on_shot_event(self, evt: ShotEvent):
         """Handle a shot event on the GUI thread (queued from the camera thread)."""
         if evt.outcome == ShotOutcome.DROPPED:
-            model = getattr(self.controller, "jobs_model", None) if self.controller else None
-            if model is not None:
+            # The current jobs model lives on the table (set via setModel), which also
+            # handles schedule rebuilds. The view has no controller back-reference.
+            model = self.jobs_table.model()
+            if isinstance(model, JobsTableModel):
                 model.mark_missed(evt.camera_name, evt.command, evt.scheduled_at)
             self._missed_counts[evt.camera_name] = self._missed_counts.get(evt.camera_name, 0) + 1
             self._update_missed_label()
@@ -1252,6 +1254,7 @@ class SolarEclipseController(Observer):
             try:
                 if self.scheduler:
                     self.scheduler.shutdown()
+                    shot_log.write_report()  # flush the shot report at end of run
                     self.jobs_model.clear_jobs_overview()
 
                     self.view.camera_action.setEnabled(True)
@@ -2824,7 +2827,10 @@ class QJobsTableView(QTableView):
 def main():
     time_string = time.strftime("%Y%m%d-%H%M%S")
     logging.basicConfig(filename=f'{time_string}.log', level=logging.DEBUG, format='%(asctime)s %(message)s')
-    shot_log.set_run_basename(time_string)  # writes <stem>.shots.csv next to the log
+    # Write the shot report alongside the application log (see the /tmp log configured
+    # at module import) as /tmp/<timestamp>.shots.csv.
+    log_dir = os.path.dirname("/tmp/solareclipseworkbench.log")
+    shot_log.set_run_basename(os.path.join(log_dir, time_string))
     # Also log to stdout so users see debug output in terminal
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG)

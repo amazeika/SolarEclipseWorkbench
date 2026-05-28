@@ -601,7 +601,11 @@ def _serialised_on_camera(func):
     @functools.wraps(func)
     def wrapper(camera, *args, **kwargs):
         scheduled_at = datetime.now(timezone.utc)
-        camera_name = getattr(camera, "name", repr(camera))
+        # Prefer the script camera name from CameraSettings so the event matches what the
+        # jobs table shows; fall back to the live camera object's name for other commands.
+        first = args[0] if args else None
+        camera_name = first.camera_name if isinstance(first, CameraSettings) \
+            else getattr(camera, "name", repr(camera))
         description = _describe_args(func.__name__, args, kwargs)
         acquired = camera._usb_lock.acquire(timeout=_MAX_LOCK_WAIT_S)
         if not acquired:
