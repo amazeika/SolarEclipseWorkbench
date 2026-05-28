@@ -7,6 +7,7 @@ completed:
   - "Phase 2: Instrument camera.py"
   - "Phase 3: GUI — status bar + row highlight"
   - "Phase 4: CSV post-run report"
+  - "Phase 5: Integration test"
 ---
 
 # Missed-Shots Indicator — Design Document
