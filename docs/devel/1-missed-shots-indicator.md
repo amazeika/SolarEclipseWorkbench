@@ -1,8 +1,9 @@
 ---
 status: in-progress
 issue: 1
-pr: null
-completed: []
+pr: 2
+completed:
+  - "Phase 1: ShotEventBus"
 ---
 
 # Missed-Shots Indicator — Design Document
@@ -339,6 +340,13 @@ indicator and the CSV report.
 - **Headless entry point.** Is there a true non-GUI capture entry (`__main__.py` / `sew.py`)
   that runs the scheduler without `SolarEclipseView`? If not, the `atexit` hook may be the
   only non-GUI path and the `closeEvent` write is the primary one.
+- **Package-level Qt import (blocks Acceptance #6).** `solareclipseworkbench/__init__.py`
+  does `from solareclipseworkbench.gui import sync_cameras`, so importing *any* submodule
+  (`import solareclipseworkbench.camera`) runs `__init__.py` and pulls in PyQt — Acceptance
+  criterion #6 (`camera.py` importable without PyQt) cannot hold at the package level until
+  `__init__.py` is restructured (e.g. lazy/deferred GUI import). `shot_events.py` itself is
+  Qt-free (verified in Phase 1); the leak is pre-existing in `__init__.py`, not introduced
+  by this feature. Decide whether fixing it is in scope here or a separate cleanup.
 - **Empty-run CSV.** Write a header-only CSV when no shots fired, or skip the file? (Lean:
   write header-only for predictability.)
 - **Component doc root.** This spec lives in `docs/devel/` (repo already has a top-level
