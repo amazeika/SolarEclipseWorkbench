@@ -6,10 +6,12 @@ import time
 
 import gphoto2
 import gphoto2 as gp
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 
 from gphoto2 import Camera
+
+from solareclipseworkbench.shot_events import BUS, ShotEvent, ShotOutcome
 
 
 class CameraError(Exception):
@@ -554,6 +556,31 @@ def _find_capturemode_choice(widget, want_continuous: bool = False) -> Optional[
 _MAX_LOCK_WAIT_S: float = 1.5
 
 
+def _describe_args(func_name: str, args: tuple, kwargs: dict) -> str:
+    """Short, human-readable description of a capture call for shot reports.
+
+    Mirrors the COMMAND-column formatting in gui.JobsTableModel: for the capture
+    commands it highlights the CameraSettings (shutter / aperture / ISO) plus any
+    trailing parameter; for everything else it falls back to a plain args repr.
+    The first positional arg is the CameraSettings (the decorated functions take
+    ``(camera, camera_settings, ...)`` and ``camera`` is consumed by the wrapper).
+    """
+    settings = args[0] if args else None
+    if isinstance(settings, CameraSettings) and func_name in (
+        "take_picture", "take_burst", "take_bracket", "take_hdr",
+    ):
+        base = f"{settings.shutter_speed}, {settings.aperture}, {settings.iso}"
+        extra = args[1] if len(args) > 1 else None
+        if extra is None:
+            return base
+        suffix = {"take_burst": f"{extra}s", "take_hdr": f"{extra} stops"}.get(
+            func_name, f"{extra}"
+        )
+        return f"{base}, {suffix}"
+    parts = [repr(a) for a in args] + [f"{k}={v!r}" for k, v in kwargs.items()]
+    return ", ".join(parts)
+
+
 def _serialised_on_camera(func):
     """Decorator that serialises access to the physical camera.
 
@@ -566,9 +593,16 @@ def _serialised_on_camera(func):
     this shot well past its scheduled time, undermining the timing accuracy
     that eclipse photography requires.
     functools.wraps preserves __name__ so GUI table formatting still works.
+
+    Each call publishes exactly one ShotEvent (dropped / fired / failed) on the
+    Qt-free shot-event bus so the GUI and the post-run report can observe shot
+    outcomes without changing the drop decision above.
     """
     @functools.wraps(func)
     def wrapper(camera, *args, **kwargs):
+        scheduled_at = datetime.now(timezone.utc)
+        camera_name = getattr(camera, "name", repr(camera))
+        description = _describe_args(func.__name__, args, kwargs)
         acquired = camera._usb_lock.acquire(timeout=_MAX_LOCK_WAIT_S)
         if not acquired:
             logging.warning(
@@ -576,9 +610,38 @@ def _serialised_on_camera(func):
                 '(shot is too late; timing accuracy preserved)',
                 func.__name__, _MAX_LOCK_WAIT_S,
             )
+            BUS.publish(ShotEvent(
+                camera_name=camera_name,
+                command=func.__name__,
+                scheduled_at=scheduled_at,
+                fired_at=scheduled_at,
+                outcome=ShotOutcome.DROPPED,
+                description=description,
+            ))
             return
         try:
-            return func(camera, *args, **kwargs)
+            result = func(camera, *args, **kwargs)
+        except Exception as exc:
+            BUS.publish(ShotEvent(
+                camera_name=camera_name,
+                command=func.__name__,
+                scheduled_at=scheduled_at,
+                fired_at=datetime.now(timezone.utc),
+                outcome=ShotOutcome.FAILED,
+                description=description,
+                detail=f"{type(exc).__name__}: {exc}",
+            ))
+            raise
+        else:
+            BUS.publish(ShotEvent(
+                camera_name=camera_name,
+                command=func.__name__,
+                scheduled_at=scheduled_at,
+                fired_at=datetime.now(timezone.utc),
+                outcome=ShotOutcome.FIRED,
+                description=description,
+            ))
+            return result
         finally:
             camera._usb_lock.release()
     return wrapper

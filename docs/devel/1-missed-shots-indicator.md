@@ -4,6 +4,7 @@ issue: 1
 pr: 2
 completed:
   - "Phase 1: ShotEventBus"
+  - "Phase 2: Instrument camera.py"
 ---
 
 # Missed-Shots Indicator — Design Document
