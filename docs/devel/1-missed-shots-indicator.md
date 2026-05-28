@@ -9,6 +9,7 @@ completed:
   - "Phase 4: CSV post-run report"
   - "Phase 5: Integration test"
   - "Phase 6: Outcome"
+  - "Phase 7: Documentation"
 ---
 
 # Missed-Shots Indicator — Design Document

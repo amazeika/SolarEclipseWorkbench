@@ -33,6 +33,7 @@
   - [Script file format](#script-file-format)
     - [General remarks](#general-remarks)
     - [Commands](#commands)
+  - [Missed-shot indicator and shot report](#missed-shot-indicator-and-shot-report)
   - [Shortcomings](#shortcomings)
   - [Converting scripts from Solar Eclipse Maestro](#converting-scripts-from-solar-eclipse-maestro)
   - [Error handling](#error-handling)
@@ -773,6 +774,50 @@ endfor
 | TAKEBST              | 1.0           |
 | TAKEBKT              | 1.0           |
 
+
+## Missed-shot indicator and shot report
+
+When shots are scheduled very close together (for example a tightly-packed corona
+sequence, or a `take_hdr` / `take_burst` around maximum eclipse), a slower camera body may
+still be busy with the previous shot when the next one is due. To protect the timing of the
+rest of the sequence, Solar Eclipse Workbench **skips** a shot that cannot start within
+1.5 s of its scheduled time rather than firing it late (see [Shortcomings](#shortcomings)).
+Previously this skip was only visible as a line in the log file; it is now surfaced live and
+recorded in a per-run report.
+
+### Live feedback in the GUI
+
+- A **`Missed: N`** counter in the status bar (bottom of the window) shows how many shots
+  have been skipped, broken down per camera (e.g. `Missed: 2 (EOS 1100D: 2)`). It turns red
+  as soon as any shot is missed, so you can react during the eclipse.
+- In the **scheduled-jobs table**, each skipped shot's row turns red.
+
+If you see the counter climbing, your shots are spaced more tightly than that camera can
+keep up with — widen the spacing, or use a faster body for the dense sections.
+
+### Per-run CSV report
+
+When the application closes, a report named `<timestamp>.shots.csv` is written next to the
+log file `<timestamp>.log` (the timestamp is the start time of the run). It contains one row
+per scheduled shot:
+
+| Column | Meaning |
+| ------ | ------- |
+| `scheduled_at` | When the shot was due to start (UTC, ISO-8601). |
+| `fired_at` | When the shot actually completed (UTC); equal to `scheduled_at` for skipped shots. |
+| `drift_ms` | `fired_at − scheduled_at` in milliseconds — how late the shot ran. `0` for skipped shots (they never ran). |
+| `outcome` | `fired` (taken), `dropped` (skipped), or `failed` (an error was raised). |
+| `camera` | Camera name. |
+| `command` | `take_picture`, `take_burst`, `take_hdr`, etc. |
+| `description` | Shutter / aperture / ISO and any extra parameter. |
+| `detail` | Error message for `failed` shots; empty otherwise. |
+
+A non-zero `drift_ms` on a `fired` shot means the image *was* taken, just late (the camera
+was still finishing the previous shot). A `dropped` row means no image was taken for that
+slot. Use the report after a run to find where your sequence outpaced the camera.
+
+> For `take_hdr` and `take_burst`, the report records one row for the whole call, not one
+> per sub-frame.
 
 ## Shortcomings
 
