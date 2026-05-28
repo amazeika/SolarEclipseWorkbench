@@ -44,6 +44,7 @@ from solareclipseworkbench.camera import get_camera_dict, get_battery_level, get
     sony_save_destination_needs_downloader
 from solareclipseworkbench.observer import Observer, Observable
 from solareclipseworkbench.shot_events import BUS, ShotEvent, ShotOutcome
+from solareclipseworkbench import shot_log
 from solareclipseworkbench.qt_utils import apply_system_color_scheme
 from solareclipseworkbench.reference_moments import calculate_reference_moments, ReferenceMomentInfo
 from solareclipseworkbench.location_ui import ConfigManager, LocationWidget
@@ -936,6 +937,7 @@ class SolarEclipseView(QMainWindow, Observable):
             - close_event: Event that occurs when the UI window is closed
         """
 
+        shot_log.write_report()
         self.notify_observers(close_event)
 
 
@@ -2822,6 +2824,7 @@ class QJobsTableView(QTableView):
 def main():
     time_string = time.strftime("%Y%m%d-%H%M%S")
     logging.basicConfig(filename=f'{time_string}.log', level=logging.DEBUG, format='%(asctime)s %(message)s')
+    shot_log.set_run_basename(time_string)  # writes <stem>.shots.csv next to the log
     # Also log to stdout so users see debug output in terminal
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG)

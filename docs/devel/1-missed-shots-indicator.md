@@ -6,6 +6,7 @@ completed:
   - "Phase 1: ShotEventBus"
   - "Phase 2: Instrument camera.py"
   - "Phase 3: GUI — status bar + row highlight"
+  - "Phase 4: CSV post-run report"
 ---
 
 # Missed-Shots Indicator — Design Document
@@ -327,33 +328,34 @@ indicator and the CSV report.
    populated `drift_ms`.
 4. [ ] `_MAX_LOCK_WAIT_S` and silent-skip semantics unchanged; existing tests pass.
 5. [ ] No new dependencies (stdlib `csv`/`dataclasses`/`threading`/`enum` + existing PyQt).
-6. [ ] `python -c "import solareclipseworkbench.camera"` works without PyQt installed.
+6. [ ] `shot_events.py` and `camera.py`'s new code introduce no Qt import (verifiable by
+   inspection / `grep`). *Rescoped from the original "`import solareclipseworkbench.camera`
+   without PyQt": that cannot hold today because `__init__.py` and `sew.py` import `gui`
+   (→ PyQt) at module scope — pre-existing and unrelated to this feature. Tracked as a
+   separate headless-import cleanup follow-up (#3).*
 
 ---
 
 ## 5. Open Questions
 
-- **Log-path location.** The brief said `camera.py:main` builds the log filename (~line
-  898). It is actually in `gui.py` `main()` ([gui.py:2727](../../src/solareclipseworkbench/gui.py#L2727))
-  as `{time_string}.log`, and there is a second module-level config writing
-  `/tmp/solareclipseworkbench.log` ([gui.py:71](../../src/solareclipseworkbench/gui.py#L71)).
-  Decision needed: expose the run stem (e.g. a small module-level holder set in `main()`)
-  vs. derive the CSV path some other way. Affects Phase 4 step 3.
-- **Headless entry point.** Is there a true non-GUI capture entry (`__main__.py` / `sew.py`)
-  that runs the scheduler without `SolarEclipseView`? If not, the `atexit` hook may be the
-  only non-GUI path and the `closeEvent` write is the primary one.
-- **Package-level Qt import (blocks Acceptance #6).** `solareclipseworkbench/__init__.py`
-  does `from solareclipseworkbench.gui import sync_cameras`, so importing *any* submodule
-  (`import solareclipseworkbench.camera`) runs `__init__.py` and pulls in PyQt — Acceptance
-  criterion #6 (`camera.py` importable without PyQt) cannot hold at the package level until
-  `__init__.py` is restructured (e.g. lazy/deferred GUI import). `shot_events.py` itself is
-  Qt-free (verified in Phase 1); the leak is pre-existing in `__init__.py`, not introduced
-  by this feature. Decide whether fixing it is in scope here or a separate cleanup.
-- **Empty-run CSV.** Write a header-only CSV when no shots fired, or skip the file? (Lean:
-  write header-only for predictability.)
-- **Component doc root.** This spec lives in `docs/devel/` (repo already has a top-level
-  `docs/`). Confirm this is the intended `<component>/docs/devel/` location before Wire-Up
-  creates `INDEX.md` there.
+- **~~Log-path location.~~** *Resolved (Phase 4).* The run stem comes from `gui.main()`'s
+  `time_string`; a module-level holder in `shot_log.py` (`set_run_basename`) is set there,
+  and the report is written to `{time_string}.shots.csv`. (The brief wrongly placed the log
+  filename in `camera.py`; it is in `gui.py main()`.)
+- **~~Headless entry point.~~** *Resolved (Phase 4).* There is no separate non-GUI scheduler
+  entry — `gui.main()` is the only entry and runs the scheduler inside the GUI app. So
+  `SolarEclipseView.closeEvent` is the primary write path; the `atexit` handler in
+  `shot_log.py` is the backstop for abnormal/headless exits.
+- **~~Package-level Qt import (Acceptance #6).~~** *Resolved (Phase 4): rescope + follow-up.*
+  `__init__.py:7` (`from ...gui import sync_cameras`) and `sew.py:7` import `gui` (→ PyQt) at
+  module scope, so importing any submodule pulls in PyQt — pre-existing, unrelated to this
+  feature. Criterion #6 was rescoped to "`shot_events.py`/`camera.py` new code add no Qt"
+  (true, verified). The broader "make capture importable headless" cleanup
+  (`__init__.py`, `sew.py`, `utils.py` re-exports) is tracked as a separate issue (#3).
+- **~~Empty-run CSV.~~** *Resolved (Phase 4).* `write_csv` always writes the header row, so
+  an empty run yields a header-only CSV (predictable for downstream tooling).
+- **~~Component doc root.~~** *Resolved (Wire-Up).* Confirmed `docs/devel/` (repo root),
+  matching the existing top-level `docs/`.
 
 ---
 
