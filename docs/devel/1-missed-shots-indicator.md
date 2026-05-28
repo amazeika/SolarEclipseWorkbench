@@ -8,6 +8,7 @@ completed:
   - "Phase 3: GUI — status bar + row highlight"
   - "Phase 4: CSV post-run report"
   - "Phase 5: Integration test"
+  - "Phase 6: Outcome"
 ---
 
 # Missed-Shots Indicator — Design Document
@@ -324,12 +325,15 @@ indicator and the CSV report.
 ## 4. Verification
 
 1. [ ] Sim run dropping shots shows `Missed: N` climbing live, red background once N > 0.
-2. [ ] Each dropped shot's row turns red on the GUI thread within ~250 ms.
-3. [ ] Closing the app writes `*.shots.csv` next to the log with one row per shot and
-   populated `drift_ms`.
-4. [ ] `_MAX_LOCK_WAIT_S` and silent-skip semantics unchanged; existing tests pass.
-5. [ ] No new dependencies (stdlib `csv`/`dataclasses`/`threading`/`enum` + existing PyQt).
-6. [ ] `shot_events.py` and `camera.py`'s new code introduce no Qt import (verifiable by
+   *(Pending manual smoke — counter logic + dropped-count proven by tests, live widget not
+   rendered in CI.)*
+2. [ ] Each dropped shot's row turns red on the GUI thread within ~250 ms. *(Pending manual
+   smoke — `mark_missed`/`BackgroundRole` proven by tests, live repaint not rendered in CI.)*
+3. [x] Closing the app writes `*.shots.csv` next to the log with one row per shot and
+   populated `drift_ms`. *(`shot_log` tests + integration test.)*
+4. [x] `_MAX_LOCK_WAIT_S` and silent-skip semantics unchanged; existing tests pass. *(28 tests pass.)*
+5. [x] No new dependencies (stdlib `csv`/`dataclasses`/`threading`/`enum` + existing PyQt).
+6. [x] `shot_events.py` and `camera.py`'s new code introduce no Qt import (verifiable by
    inspection / `grep`). *Rescoped from the original "`import solareclipseworkbench.camera`
    without PyQt": that cannot hold today because `__init__.py` and `sew.py` import `gui`
    (→ PyQt) at module scope — pre-existing and unrelated to this feature. Tracked as a
@@ -362,4 +366,27 @@ indicator and the CSV report.
 
 ## Outcome
 
-<!-- Filled in during/after implementation. -->
+Implemented in phases 1–5 on `feature/1-missed-shots-indicator` (issue #1, PR #2). Built
+as designed — Qt-free `ShotEventBus`, camera instrumentation, GUI status bar + row
+highlight, and a per-run CSV — with these deviations from the original brief:
+
+- **Log-path location.** The brief placed the run-log filename in `camera.py:main`; it is
+  actually in `gui.py main()` (`{time_string}.log`). The CSV stem is derived there via
+  `shot_log.set_run_basename(time_string)`, not by promoting a helper into `camera.py`.
+- **`ShotLog` placement.** Rather than living on the view, `ShotLog` is a module-level
+  self-subscribing singleton (`shot_log.LOG`) plus an `atexit` backstop, so the report is
+  recorded independently of the GUI. The view only triggers the write in `closeEvent`.
+- **Dropped-shot `drift_ms` = 0.** The brief's §5 test-plan prose expected `drift_ms ≈ 1500`
+  for drops, contradicting the design (§3.2 / Event→outcome mapping), which sets
+  `fired_at = scheduled_at` for drops. Implementation and tests use **0** (the "never ran"
+  sentinel); drift is meaningful only for fired/failed shots.
+- **Acceptance #6 rescoped.** Full headless import of `camera.py` without PyQt is blocked by
+  pre-existing module-scope `gui` imports in `__init__.py` and `sew.py`. #6 was narrowed to
+  "new code adds no Qt"; the broader cleanup is tracked in #3.
+- **No live-GUI verification.** Verification items 1–2 (live counter climbing, on-screen red
+  rows) are pending the manual smoke test — the underlying logic is unit/integration tested,
+  but the rendered widgets were not exercised in CI (no display).
+
+Tests added: `test_shot_events.py`, `test_camera_shot_events.py`,
+`test_jobs_table_model_missed.py`, `test_shot_log.py`, `test_missed_shots_integration.py`
+(28 total pass, no regressions).
