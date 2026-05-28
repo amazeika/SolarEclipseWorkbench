@@ -5,6 +5,7 @@ pr: 2
 completed:
   - "Phase 1: ShotEventBus"
   - "Phase 2: Instrument camera.py"
+  - "Phase 3: GUI — status bar + row highlight"
 ---
 
 # Missed-Shots Indicator — Design Document
