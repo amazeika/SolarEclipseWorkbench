@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: shipped
 issue: 4
 pr: 5
 completed:
