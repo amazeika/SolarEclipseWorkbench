@@ -4,8 +4,8 @@ Design documents for planned and shipped features. See `.claude/skills/specs` fo
 
 ## In Progress
 
-- [Missed-Shots Indicator](1-missed-shots-indicator.md) — live status-bar counter, red row highlight, and post-run CSV report for silently-dropped shots (#1).
+_None yet._
 
 ## Shipped
 
-_None yet._
+- [Missed-Shots Indicator](1-missed-shots-indicator.md) — live status-bar counter, red row highlight, and post-run CSV report for silently-dropped shots (#1).
