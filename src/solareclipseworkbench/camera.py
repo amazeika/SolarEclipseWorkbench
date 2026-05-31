@@ -750,57 +750,71 @@ def _wait_for_capture_complete(target, context, timeout_ms: int = 3000, max_even
                   broke_on, trailing)
 
 
-def _wait_for_burst_complete(target, context, idle_timeout_ms: int = 600, max_waits: int = 300) -> None:
-    """Block until the camera's USB interface is idle after a burst.
+def _wait_for_burst_complete(target, context, frame_idle_ms: int = 1000,
+                             max_total_ms: int = 12000, poll_ms: int = 200) -> None:
+    """Release once a burst's frames are in, ignoring the camera's event chatter.
 
-    Unlike a single shot, a burst writes many frames that the body flushes to
-    the card over several seconds.  ``_wait_for_capture_complete`` breaks on the
-    *first* GP_EVENT_FILE_ADDED, which is correct for one frame but releases the
-    USB lock while the remaining burst frames are still transferring -- the next
-    scheduled shot then starts mid-transfer and fails with -110 (I/O in
-    progress).  Instead, keep consuming events until a full ``idle_timeout_ms``
-    window passes with no event, i.e. the body has finished flushing and the
-    interface is quiet.
+    A Canon burst emits ~15 GP_EVENT_FILE_ADDED (the frames) followed by a long
+    tail of hundreds of GP_EVENT_UNKNOWN status events streaming for several
+    seconds (measured: 84-213 UNKNOWN vs 15 FILE_ADDED, ~7 s, on a 70D).  Waiting
+    for *all* events to stop (true idle) holds the USB lock through that chatter
+    (~9 s) -- long enough to drop the next scheduled contact burst (the diamond
+    ring / Baily's beads).  But breaking on the *first* frame (as a single shot
+    does) releases mid-burst and fails the next shot with -110.
 
-    Each ``gp_camera_wait_for_event`` returns as soon as an event arrives, so
-    during active write-back the loop spins quickly; it only blocks for the full
-    ``idle_timeout_ms`` once the body goes quiet, then returns.  ``max_waits``
-    bounds the total wait so a chatty body cannot stall the scheduler
-    (default ~36 s ceiling; real bursts settle in a few seconds).
+    So wait for the *frames* to settle: keep consuming events (draining the queue)
+    until no FILE_ADDED / CAPTURE_COMPLETE has arrived for ``frame_idle_ms``, then
+    release -- without waiting out the UNKNOWN tail.  ``max_total_ms`` bounds the
+    whole wait so a body that never quiets cannot stall the scheduler.
+
+    Note: this assumes the UNKNOWN tail is status chatter, not ongoing card I/O.
+    If a shot scheduled right after a burst still hits -110, that assumption is
+    wrong and the tail must be waited out.
 
     Args:
-        target:          gphoto2 Camera object.
-        context:         gphoto2 context.
-        idle_timeout_ms: A wait this long with no event means the burst is done.
-        max_waits:       Safety cap on iterations.
+        target:        gphoto2 Camera object.
+        context:       gphoto2 context.
+        frame_idle_ms: release this long after the last frame event.
+        max_total_ms:  hard ceiling on the total wait.
+        poll_ms:       per-iteration event-wait timeout.
     """
     start = time.monotonic()
     counts: dict[str, int] = {}
-    reason = "max_waits"
-    for _ in range(max_waits):
+    last_frame = None  # monotonic time of the most recent FILE_ADDED/CAPTURE_COMPLETE
+    reason = "max_total"
+    while True:
+        now = time.monotonic()
+        if (now - start) * 1000 >= max_total_ms:
+            reason = "max_total"
+            break
+        if last_frame is not None and (now - last_frame) * 1000 >= frame_idle_ms:
+            reason = "frames_settled"
+            break
         try:
             event_type, _ = gp.check_result(
-                gp.gp_camera_wait_for_event(target, idle_timeout_ms, context)
+                gp.gp_camera_wait_for_event(target, poll_ms, context)
             )
         except gphoto2.GPhoto2Error:
             reason = "error"
             break
         if event_type == gp.GP_EVENT_TIMEOUT:
-            reason = "idle"
-            break
+            if last_frame is None:
+                # Queue went quiet before any frame arrived -- nothing to wait for.
+                reason = "idle_no_frames"
+                break
+            continue
         name = _event_name(event_type)
         counts[name] = counts.get(name, 0) + 1
-    # Diagnostic: the per-type histogram + elapsed time tells us what a slow
-    # burst is actually waiting on. A count near one burst's frame total
-    # (~14 for a 2 s Canon burst) spread over a long elapsed time => slow card
-    # flush; a flood of one type (e.g. UNKNOWN) => event spam, not real frames;
-    # stop=max_waits => we hit the cap before the queue went quiet (the lock may
-    # be released mid-flush). max_waits is raised for this diagnostic so we can
-    # observe the true count and whether idle is ever reached.
-    total = sum(counts.values())
+        if event_type in (gp.GP_EVENT_FILE_ADDED, gp.GP_EVENT_CAPTURE_COMPLETE):
+            last_frame = time.monotonic()
+    frames = counts.get("FILE_ADDED", 0) + counts.get("CAPTURE_COMPLETE", 0)
+    last_frame_ms = (last_frame - start) * 1000 if last_frame is not None else -1
     histogram = " ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "-"
-    logging.info("burst settle: drained %d event(s) [%s] over %.0f ms (stop: %s)",
-                 total, histogram, (time.monotonic() - start) * 1000, reason)
+    logging.info(
+        "burst settle: %d frame event(s), last at %.0f ms; released at %.0f ms "
+        "(stop: %s); drained [%s]",
+        frames, last_frame_ms, (time.monotonic() - start) * 1000, reason, histogram,
+    )
 
 
 def _sony_drain_events(target, context) -> None:
