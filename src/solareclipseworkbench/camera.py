@@ -1722,14 +1722,18 @@ def get_camera(camera_name: str):
         # set config
         gp.gp_camera_set_config(camera, config, context)
 
-        # Try to set the drivemode to Continuous high speed (for cameras that support it)
-        # Note: Not all cameras have this widget (e.g., Nikon Z-series mirrorless cameras)
+        # Establish the documented default drive mode: Single.  Per-command code
+        # owns drive mode from here — take_picture stays single-frame and take_burst
+        # switches to continuous for the burst (restoring Single afterwards).  A prior
+        # "Continuous high speed" here was misleading: it was immediately overridden.
+        # Not all cameras expose this widget (e.g. some Nikon Z-series mirrorless).
         try:
             drive_mode = gp.check_result(gp.gp_widget_get_child_by_name(config, 'drivemode'))
-            gp.gp_widget_set_value(drive_mode, "Continuous high speed")
-            # set config
-            gp.gp_camera_set_config(camera, config, context)
-            logging.debug('Set drivemode to Continuous high speed for %s', camera_name)
+            single = _find_drive_mode_choice(drive_mode, want_continuous=False)
+            if single is not None:
+                gp.gp_widget_set_value(drive_mode, single)
+                gp.gp_camera_set_config(camera, config, context)
+                logging.debug('Set drivemode to "%s" (default) for %s', single, camera_name)
         except gphoto2.GPhoto2Error as e:
             # drivemode widget doesn't exist or value not supported - this is OK for many cameras
             logging.debug('Could not set drivemode for %s (this is normal for some camera models): %s', camera_name, e)
@@ -1805,11 +1809,15 @@ def get_camera_by_port(model_name: str, port: str, alias: Optional[str] = None) 
         logging.debug('Set capturetarget to "%s" for %s', value, display_name)
         gp.gp_camera_set_config(camera, config, context)
 
+        # Establish the documented default drive mode: Single (see get_camera).
+        # take_burst switches to continuous itself and restores Single afterwards.
         try:
             drive_mode = gp.check_result(gp.gp_widget_get_child_by_name(config, 'drivemode'))
-            gp.gp_widget_set_value(drive_mode, "Continuous high speed")
-            gp.gp_camera_set_config(camera, config, context)
-            logging.debug('Set drivemode to Continuous high speed for %s', display_name)
+            single = _find_drive_mode_choice(drive_mode, want_continuous=False)
+            if single is not None:
+                gp.gp_widget_set_value(drive_mode, single)
+                gp.gp_camera_set_config(camera, config, context)
+                logging.debug('Set drivemode to "%s" (default) for %s', single, display_name)
         except gphoto2.GPhoto2Error as e:
             logging.debug('Could not set drivemode for %s: %s', display_name, e)
     except gphoto2.GPhoto2Error as e:

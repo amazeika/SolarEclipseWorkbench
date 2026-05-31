@@ -5,6 +5,7 @@ pr: 5
 completed:
   - "Phase 1: Fix the Canon burst (continuous drive in take_burst)"
   - "Phase 5: Fix _wait_for_capture_complete (break on FILE_ADDED)"
+  - "Phase 4: Init drive-mode cleanup (reduced scope)"
 ---
 
 # Canon Capture Performance — Design Document
@@ -96,8 +97,8 @@ The capture path stays gphoto2-only. We attack the four cost centres in order of
       ┌────────────────────────────────┼────────────────────────────────┐
       ▼                                ▼                                 ▼
  take_picture                     take_burst                         take_hdr
- stays Single (from          set Continuous (Canon) then         set_single_config
- adapter → session init)     restore Single in finally           per shutter step
+ stays Single                set Continuous (Canon) then         (host ramp;
+ (adapter asserts it)        restore Single in finally           wait fix in P5)
 ```
 
 ### Drive-mode ownership (Phases 1 & 4)
@@ -105,7 +106,8 @@ The capture path stays gphoto2-only. We attack the four cost centres in order of
 Drive mode is owned per-command, not by the shared adapter:
 
 - **`take_burst`** (Phase 1) explicitly sets the body's fastest continuous mode *after* `__adapt_camera_settings` returns, then restores Single in a `finally` block (so a mid-burst error still leaves the camera deterministic).
-- **Single-frame** for every other command stays cheap. In **Phase 1** it remains `__adapt_camera_settings`'s batched in-memory mutation — **zero extra round-trip**, since it rides the adapter's existing config push. In **Phase 4** it moves to a one-time **session-init constant** and the per-shot mutation is stripped from the adapter.
+- **Single-frame** for every other command stays cheap: it remains `__adapt_camera_settings`'s batched in-memory mutation — **zero extra round-trip**, since it rides the adapter's existing config push. (Phase 4 originally planned to move this to a one-time session-init constant, but the measurement showed config writes are ~1.4% of a shot, so that refactor was dropped — see Phase 4. The per-shot assertion stays for robustness.)
+- **Init** (`get_camera`/`get_camera_by_port`) establishes the documented default of `Single` at connect (Phase 4), replacing a misleading `"Continuous high speed"` write that was immediately overridden.
 
 A new helper `_find_drive_mode_choice(widget, want_continuous)` — modelled on the existing `_find_capturemode_choice` ([camera.py:528](../../src/solareclipseworkbench/camera.py#L528)) — resolves the body-specific choice string: for continuous, prefer a choice containing `"high"`, else the first `"continuous"`; for single, the first `"single"`.
 
@@ -196,15 +198,15 @@ Steps:
 Steps:
 1. Replace the full `gp_camera_set_config` in the HDR loop with `gp_camera_set_single_config(target, "shutterspeed", speed_widget, context)`.
 
-### Phase 4: One-time Canon session init (+ remove per-shot drive-mode writes)
+### Phase 4: Init drive-mode cleanup *(reduced scope — measurement)*
 
-**Goal:** move per-session constants out of the per-shot path so the adapter stops re-writing them every shot.
+**Original goal** was to move per-session constants out of the per-shot path via a `CanonCamera.ensure_session_initialised()` hook and strip `autoexposuremodedial`/`drivemode` from `__adapt_camera_settings`.
 
-Steps:
-1. Add `ensure_session_initialised()` to `CanonCamera` with a `_session_initialised` flag (reset on connect/disconnect).
-2. Push `autoexposuremodedial=Manual`, `drivemode=Single`, `capturetarget`=card in one `set_config`.
-3. Call it at the top of `__adapt_camera_settings` for Canon; strip those constants — including the `drivemode=Single` mutation at [camera.py:1019-1024](../../src/solareclipseworkbench/camera.py#L1019-L1024) (the piece Phase 1 deliberately left in place) — from the per-shot path. With Single set once at session init and restored by `take_burst`, `take_picture` stays single-frame without any per-shot push.
-4. Reconcile the `get_camera_by_port` post-init drivemode line ([camera.py:1735](../../src/solareclipseworkbench/camera.py#L1735)) — leave the body in Single at init (session init now owns it), not `"Continuous high speed"`.
+**Reduced post-measurement.** Config writes are ~1.4% of a shot and those mutations are *batched* into the existing push, so the refactor saves **0 ms** while churning the now-validated hot path and removing the per-shot re-assertion of a known state (a small robustness loss). Not worth it for a reliability-critical tool. **The session-init refactor and the strip-from-`__adapt` are dropped.**
+
+What *was* done — the genuinely useful, zero-risk part:
+1. Both init paths (`get_camera` and `get_camera_by_port`) set `drivemode="Continuous high speed"` for **all** cameras at connect, which was immediately overridden (Canon) or left stale (non-Canon) — misleading dead writes. Replaced with the documented default via `_find_drive_mode_choice(want_continuous=False)` → `Single`, guarded (skips when the widget/choice is absent). Per-command code owns drive mode from there: `take_picture` stays Single, `take_burst` opts into continuous and restores Single.
+2. `__adapt_camera_settings` is left as-is — its batched `drivemode=Single` / `autoexposuremodedial=Manual` are free and keep every non-burst shot deterministic.
 
 ### Phase 5: Fix `_wait_for_capture_complete` — **THE lead phase**
 
@@ -324,6 +326,8 @@ Criteria 1–3 require a physical Canon EOS 70D and are **hardware-gated**: they
 **Verdict:** the capture wait is ~96% of per-shot time; config pushes are ~1.4%. This **inverts the audit's plan**. Re-prioritisation: **Phase 5 (wait) is the lead and effectively the whole win; Phase 2 (cache) deprioritised (~1% saving); Phase 3 (HDR push) dropped.** The ~5.7 s/shot floor is also the direct cause of dropped shots (it exceeds the 1.5 s `_MAX_LOCK_WAIT_S` guard).
 
 **Event-trace (2026-05-31, `tests/bench/event_trace.py`) — root cause of the 5.4 s wait.** One `trigger_capture`, then every `wait_for_event` logged: 23 `UNKNOWN`, 1 `FILE_ADDED` (at **+1177 ms** — image on card), 3 `TIMEOUT`, and **zero `CAPTURE_COMPLETE`**. The 70D never sends `CAPTURE_COMPLETE`; the loop (break only on CAPTURE_COMPLETE/TIMEOUT) therefore blocks until the first `TIMEOUT` at **+5340 ms** — matching the ~5.46 s measured. **Phase 5 fix:** also break on `GP_EVENT_FILE_ADDED`, so the wait ends when the image lands on the card (~1.2 s) instead of at the 5.3 s timeout.
+
+**Phase 4 (init drive-mode cleanup) — reduced & landed (2026-05-31).** The measurement removed the perf rationale (config writes ~1.4%), so the session-init refactor and the strip-from-`__adapt` were **dropped** (0 ms gain, churns validated code, less robust). Kept the zero-risk part: `get_camera` and `get_camera_by_port` now set the documented default `Single` (via `_find_drive_mode_choice`) instead of a misleading `"Continuous high speed"` that was immediately overridden. `__adapt_camera_settings` unchanged. Behavior-neutral — init drive mode is overridden by per-command code in every capture path — so no new hardware validation required; suite green.
 
 **Phase 5 (wait fix) — landed & hardware-validated (2026-05-31).** Added `GP_EVENT_FILE_ADDED` to the `_wait_for_capture_complete` break condition. On the 70D, `take_picture` median wall **5706 ms → 1259 ms** (wait 5460 → 1087 ms) and a 7-shot `take_hdr` **39.1 s → 9.2 s** — ~4.5× — with no `-110`/failed errors and all frames captured. The residual ~1.1 s/shot is the camera-bound RAW-write time (`FILE_ADDED`), the real floor. This is the single highest-impact change in the spec and also resolves the dropped-shot cadence problem (per-shot now < the 1.5 s lock guard). **Phases 2 and 3 are intentionally not implemented** (measurement showed config pushes are ~1.4% of per-shot time); they remain documented as deprioritised/dropped. Bench tools `tests/bench/perf_probe.py` (per-op timing) and `tests/bench/event_trace.py` (event timeline) added.
 
