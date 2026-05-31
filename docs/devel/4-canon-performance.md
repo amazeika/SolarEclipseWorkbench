@@ -238,7 +238,48 @@ Invoke `/docs` with a summary of the changed capture path (drive-mode ownership,
 
 ---
 
-## 4. Verification
+## 4. Evaluation protocol
+
+Every phase is validated by a **before/after measurement on the real 70D**, not by inspection. Most of this spec past Phase 1 rests on estimates (the audit's per-stage costs, the `set_single_config` speedup assumption), so the measurement *is* the evaluation — a phase that doesn't move its metric, or regresses another, does not land.
+
+### Instruments (already available — little to build)
+
+1. **Missed-shots CSV report** (from #1) — logs `fired`/`dropped`/`failed` per shot. The before/after source of truth for **drops**, the metric that actually matters during totality. Diff the CSV across runs.
+2. **`perf_counter` instrumentation** — added once in the measurement pass: wrap `gp_camera_get_config`, each config push, and `_wait_for_capture_complete` ([camera.py:654](../../src/solareclipseworkbench/camera.py#L654)) on the Canon path; emit per-stage ms at debug level. This is the timing baseline reused by every perf phase.
+3. **VirtualCamera simulator** — regression only: catches crashes, wrong frame counts, logic errors. It has **no USB cost**, so it proves nothing about timing. Never cite a simulator run as a perf result.
+
+### Bench sequence
+
+A single fixed schedule, run identically before and after each phase so comparisons are apples-to-apples:
+
+- one 18-shot corona ladder at 2 s spacing (constant ISO/aperture, varying shutter),
+- one `take_burst(2.0)`,
+- one `take_hdr(stops=5)`.
+
+Same camera, lens, card, and a charged battery each time. Commit it under `tests/bench/` (or document the script path) so it's reproducible.
+
+### Discipline
+
+- Run the bench **3–5 times** per measurement; compare **medians**, not single runs — USB/card/battery/thermal variance is real and a single run will mislead.
+- Capture **both** artifacts every run (CSV + perf log).
+- Record before/after medians in the **Outcome** section as each phase lands — that is the evidence trail, and the gate for proceeding to the next perf phase.
+
+### Per-phase metric
+
+| Phase | Primary metric | Pass condition |
+|-------|----------------|----------------|
+| 1 — Burst fix | frames from one `take_burst(2.0)` (SD-card count) | 1 → ≥10 (target ~14) |
+| Measurement pass | per-stage ms (`get_config` / pushes / wait) | baseline captured; identifies dominant cost centre |
+| 2 — Settings cache | per-shot reconfig ms + corona drops | pushes ↓ **and** drops not worse |
+| 3 — HDR `set_single_config` | total HDR wall-clock | measurable drop, else skip the phase |
+| 4 — Session init | per-shot ms | **flat — "no regression" is the pass**, no delta expected |
+| 5 — Wait-poll tightening | capture-wait ms + drops | wait-stalls ↓ **and** no new `failed`/`-110` errors |
+
+> **Hardware-access reality:** if the 70D is on hand, test after each phase. If access is intermittent, batch — ship Phase 1 + the instrumentation, then run one hardware session that baselines and validates Phases 2–5 together. Either way, no perf phase merges without its before/after numbers in the Outcome.
+
+---
+
+## 5. Verification
 
 Criteria 1–3 require a physical Canon EOS 70D and are **hardware-gated**: they stay unchecked (pending a real-hardware run) while implementation proceeds against code review, the VirtualCamera simulator, and the existing test suite. Criteria 4–6 are validated without hardware.
 
@@ -251,7 +292,7 @@ Criteria 1–3 require a physical Canon EOS 70D and are **hardware-gated**: they
 
 ---
 
-## 5. Open Questions
+## 6. Open Questions
 
 - **Fast-path return contract:** exactly what `(context, config)` should the cache fast path return so every caller still works without a `get_config`? (Blocks Phase 2.)
 - **Hardware validation:** acceptance criteria 1–3 require a physical 70D. Which runs can we validate in CI / on the simulator vs. only on real hardware?
