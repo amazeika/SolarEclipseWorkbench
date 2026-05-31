@@ -1259,6 +1259,16 @@ def take_burst(camera: Camera, camera_settings: CameraSettings, duration: float)
             gp.gp_widget_set_value(remote_release, "Release Full")
             # set config
             _set_gp_config(camera, config, context)
+
+            # Let the body finish writing the burst frames and drain the queued
+            # CaptureComplete/ObjectAdded events before the USB lock is released.
+            # A burst leaves several frames in flight; without this the next
+            # scheduled shot can acquire the lock while the driver is still
+            # mid-transfer and fail with -110 (I/O in progress) -- exactly the
+            # take_picture / take_hdr post-capture settle, which the burst path
+            # was missing.
+            target = camera._camera if hasattr(camera, '_camera') else camera
+            _wait_for_capture_complete(target, context)
         finally:
             # Restore Single drive so a subsequent take_picture is deterministic,
             # even if the burst raised partway through.
