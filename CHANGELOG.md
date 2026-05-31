@@ -28,8 +28,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   path released the USB lock without waiting for the body to finish writing the burst
   frames (unlike `take_picture` / `take_hdr`), so a shot scheduled shortly after a burst
   could acquire the lock mid-transfer and fail with `GPhoto2Error: [-110] I/O in progress`
-  (e.g. the C3-C4 #1 frame ~2 s after the Post-C3 beads burst). The burst now waits for
-  capture-complete and drains queued events before releasing the lock.
+  (e.g. the C3-C4 #1 frame ~2 s after the Post-C3 beads burst). The burst now holds the
+  lock until the body has flushed *all* burst frames and the USB interface is idle (a full
+  no-event wait), rather than breaking on the first frame as a single shot would — that
+  early break still released the lock mid-flush and is what allowed the `-110` through.
 - **Missed-shot indicator now counts failed shots**: the status-bar counter and red row
   highlight previously reacted only to *dropped* shots; a shot that was attempted but
   errored (`FAILED`, e.g. `-110 I/O in progress`) was invisible. Both outcomes now count.
