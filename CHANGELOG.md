@@ -18,6 +18,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   finishes when the frame is written to the card, cutting per-shot time from ~5.7 s to
   ~1.3 s (a 7-shot HDR drops from ~39 s to ~9 s). Because each shot now completes well
   within the scheduler's timing guard, shots spaced ~2 s apart are no longer dropped.
+- **HDR robustness on multi-file bodies**: `take_hdr` now drains any queued camera
+  events before each shot, so a body that writes more than one file per shot (e.g.
+  RAW+JPEG) cannot leave a stale event that ends the next shot's completion wait early.
 
 ### Changed
 - **Canon drive mode now defaults to Single at camera initialisation** instead of an
