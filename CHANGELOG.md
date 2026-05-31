@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- **Missed-shot indicator**: when a scheduled shot is silently dropped (the camera
+  could not acquire the USB lock within the timing guard), SEW now surfaces it live —
+  a status-bar counter and a red highlight on the dropped row in the jobs table — and
+  writes a per-run CSV report of every shot's outcome (fired / dropped / failed)
+  alongside the log. The drop behaviour itself is unchanged; this only makes missed
+  shots visible during the run instead of requiring a log trawl afterwards.
+
 ### Fixed
 - **Canon `take_burst` now produces a real burst**: it previously fired a single
   frame regardless of duration, because the shared settings adapter forced the camera
