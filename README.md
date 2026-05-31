@@ -708,7 +708,7 @@ Solar Eclipse Workbench can use the following commands:
 
 This command will take a picture 1 minutes and 2 seconds before first contact (C1) with the Canon EOS 80D.  The ISO will be set to 200, aperture to 8.0 and shutter speed to 1/1250s.
 
-- **take_burst**  - Set the aperture, shutter speed and ISO of the camera and take a burst of pictures during 3 seconds (for Canon; Nikon and Sony will take 3 pictures in burst mode).
+- **take_burst**  - Set the aperture, shutter speed and ISO of the camera and take a burst of pictures during 3 seconds (for Canon, fired at the body's continuous high-speed drive rate; Nikon and Sony will take 3 pictures in burst mode).
 
 ```take_burst, C1, +, 0:00:08.0, Canon EOS 80D, 1/2000, 5.6, 400, 3, "Burst test"```
 
@@ -716,7 +716,7 @@ This command will take a picture 1 minutes and 2 seconds before first contact (C
 
 ```take_bracket, C1, +, 0:00:08.0, Canon EOS 80D, 1/2000, 5.6, 400, "+/- 1 2/3", "Bracket test"```
 
-...**take_hdr** - Take an HDR sequence by ramping the shutter speed from a starting (fastest) speed down by the given number of full stops and back up again, while keeping aperture and ISO fixed.  Uses `gp_camera_trigger_capture` for maximum speed so successive shots are fired without waiting for each file to be written to the card.  The shutter speed choices available on the connected camera are queried at runtime, so the sequence always stays within the actual speeds the body supports.  Works on Canon EOS, Nikon, and Sony Alpha cameras.  Total shots fired: 2 × stops + 1 (the slowest exposure appears once at the midpoint).
+...**take_hdr** - Take an HDR sequence by ramping the shutter speed from a starting (fastest) speed down by the given number of full stops and back up again, while keeping aperture and ISO fixed.  Uses `gp_camera_trigger_capture`, waiting for each frame to be saved to the card before changing the shutter speed for the next shot (the shutter speed differs between shots, so they cannot overlap).  The shutter speed choices available on the connected camera are queried at runtime, so the sequence always stays within the actual speeds the body supports.  Works on Canon EOS, Nikon, and Sony Alpha cameras.  Total shots fired: 2 × stops + 1 (the slowest exposure appears once at the midpoint).
 
   The sequence for `stops=4` starting at `1/2000` would be: `1/2000 → 1/1000 → 1/500 → 1/250 → 1/125 → 1/250 → 1/500 → 1/1000 → 1/2000` (9 shots).
 
