@@ -684,21 +684,29 @@ def _serialised_on_camera(func):
 
 
 def _wait_for_capture_complete(target, context, timeout_ms: int = 3000, max_events: int = 30) -> None:
-    """Wait until the camera signals GP_EVENT_CAPTURE_COMPLETE after a trigger_capture
-    call, then flush any remaining queued events (GP_EVENT_OBJECT_ADDED, etc.).
+    """Wait until the camera reports the shot is done after a trigger_capture call,
+    then flush any remaining queued events (GP_EVENT_OBJECT_ADDED, etc.).
 
-    This is the correct inter-shot synchronisation point: CAPTURE_COMPLETE means the
-    shutter has physically closed and the camera's USB interface is free for the next
-    command. Waiting only on TIMEOUT (as _drain_camera_events does) is unreliable
-    because CAPTURE_COMPLETE can arrive several hundred milliseconds after the trigger
-    on slower bodies (e.g. Canon EOS 80D), causing subsequent gp_camera_set_config /
-    gp_camera_trigger_capture calls to fail with -110 I/O in progress.
+    The loop returns as soon as it sees any of:
+
+      * GP_EVENT_CAPTURE_COMPLETE — the canonical "shutter closed, USB free" signal,
+        emitted by some bodies (e.g. Canon EOS 80D) a few hundred ms after the trigger.
+      * GP_EVENT_FILE_ADDED — the image has been committed to the card, which equally
+        means the shot is done and the interface is free.  This is essential because
+        **many Canon bodies (e.g. the EOS 70D) never emit CAPTURE_COMPLETE at all**.
+        Without this, the loop blocks until the first GP_EVENT_TIMEOUT — measured at
+        ~5.3 s/shot on a 70D (the camera goes quiet ~2 s after the ~1.2 s FILE_ADDED,
+        and the next 3 s poll then times out), which both throttles sequences to
+        ~5.7 s/shot and trips the USB-lock drop guard.  Breaking on FILE_ADDED cuts
+        the wait to ~1.2 s/shot.
+      * GP_EVENT_TIMEOUT — fallback when neither completion event arrives.
 
     Args:
         target:      gphoto2 Camera object.
         context:     gphoto2 context.
         timeout_ms:  Per-wait timeout in milliseconds. 3000 ms gives enough headroom
-                     even for slow Canon bodies writing RAW files.
+                     for slow bodies; real events return as soon as they arrive, so
+                     this only bounds the idle fallback.
         max_events:  Safety cap on iterations to avoid an infinite loop.
     """
     for _ in range(max_events):
@@ -706,7 +714,9 @@ def _wait_for_capture_complete(target, context, timeout_ms: int = 3000, max_even
             event_type, _ = gp.check_result(
                 gp.gp_camera_wait_for_event(target, timeout_ms, context)
             )
-            if event_type in (gp.GP_EVENT_CAPTURE_COMPLETE, gp.GP_EVENT_TIMEOUT):
+            if event_type in (gp.GP_EVENT_CAPTURE_COMPLETE,
+                              gp.GP_EVENT_FILE_ADDED,
+                              gp.GP_EVENT_TIMEOUT):
                 break
         except gphoto2.GPhoto2Error:
             break

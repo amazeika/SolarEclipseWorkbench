@@ -4,6 +4,7 @@ issue: 4
 pr: 5
 completed:
   - "Phase 1: Fix the Canon burst (continuous drive in take_burst)"
+  - "Phase 5: Fix _wait_for_capture_complete (break on FILE_ADDED)"
 ---
 
 # Canon Capture Performance — Design Document
@@ -161,6 +162,8 @@ A Canon-only `ensure_session_initialised()` that pushes the constants `autoexpos
 Phases mirror the audit's suggested PR layout. Each is independently testable; **Phase 1 is the user-visible bug and ships first.**
 
 > **Measurement gate.** Phase 1 (burst correctness) ships unconditionally. Phases 2–5 are **gated on a measurement pass**: instrument the Canon capture path with `perf_counter` around `get_config`, each config push, and `_wait_for_capture_complete`, then run one representative corona sequence on the 70D. Only build the perf phases the data justifies — if drops trace to the capture-wait stall, Phase 5 matters more than Phases 2–4; if they trace to config pushes, Phase 2 leads. Do not implement 2–5 blind on the audit's estimates.
+>
+> **RESULT (2026-05-31, real 70D — see Outcome for the table).** The wait dominates overwhelmingly: per `take_picture` ≈ **5.7 s wall, of which ~5.46 s (96%) is `_wait_for_capture_complete`**; `get_config` ≈ 24 ms and both config pushes ≈ 57 ms combined. So the audit's premise — ~600–1500 ms of per-shot *config* overhead — is **false on this body** (config is ~80 ms, ~1.4%). **Phase 5 is now the lead and the only phase that matters; Phase 2 is deprioritized (~1% saving) and Phase 3 is dropped (HDR per-shot is 5.41 s wait vs 36 ms push).** The 5.7 s/shot floor also explains drops directly: it exceeds `_MAX_LOCK_WAIT_S` (1.5 s), so any shot scheduled within ~6 s of another is dropped. Next step is an event-trace to learn *why* the wait is 5.4 s before designing the Phase 5 fix.
 
 ### Phase 1: Fix the Canon burst (continuous drive in `take_burst`)
 
@@ -172,9 +175,9 @@ Steps:
 
 **Deviation from the audit's split (see Drive-mode ownership above):** removing `drivemode=Single` from `__adapt_camera_settings` and adding a defensive Single push to `take_picture` is *not* done here — it would add a per-shot round-trip. `__adapt` keeping its batched Single is harmless (burst overrides it) and free for non-burst commands, so the adapter cleanup + `get_camera_by_port` init reconcile move to **Phase 4**.
 
-### Phase 2: Per-camera settings cache + `set_single_config`
+### Phase 2: Per-camera settings cache + `set_single_config` *(deprioritised — measurement says ~1% win)*
 
-**Goal:** per-shot cost from ~600–1500 ms to ~100–300 ms when only shutter varies.
+**Goal (revised by measurement):** the original premise (~600–1500 ms/shot in config) was false on the 70D — config pulls+pushes are ~80 ms/shot (~1.4% of the ~5.7 s wall). This phase saves almost nothing on its own and only matters as scaffolding if a future body proves config-bound. **Do not build before Phase 5; likely skip.**
 
 Steps:
 1. Add module-level `_last_applied` dict and `_set_single` helper.
@@ -184,11 +187,11 @@ Steps:
 5. Invalidate `_last_applied` in adapter `connect`/`disconnect`.
 6. Log a debug line on cache miss.
 
-### Phase 3: `take_hdr` uses `set_single_config` *(low priority — measurement-gated)*
+### Phase 3: `take_hdr` uses `set_single_config` *(DROPPED — measurement)*
 
 **Goal:** modest speedup of the host-driven HDR ramp.
 
-> **Note:** with native AEB rejected, this is the only HDR optimization on the table — but it's small. It saves one full config push per shot (~150 ms), while the dominant per-shot HDR cost is the camera-bound capture wait (`_wait_for_capture_complete`), which Phase 5 addresses. Implement this **only if** the measurement pass shows the per-shot config push (not the capture wait) is a meaningful share of HDR time. Otherwise skip it.
+> **Dropped.** The measurement settles it: HDR per-shot is ~5.41 s wait vs ~36 ms config push. Replacing the push with `set_single_config` saves <1% of HDR time. Not worth doing. The HDR win, if any, comes entirely from Phase 5.
 
 Steps:
 1. Replace the full `gp_camera_set_config` in the HDR loop with `gp_camera_set_single_config(target, "shutterspeed", speed_widget, context)`.
@@ -203,12 +206,17 @@ Steps:
 3. Call it at the top of `__adapt_camera_settings` for Canon; strip those constants — including the `drivemode=Single` mutation at [camera.py:1019-1024](../../src/solareclipseworkbench/camera.py#L1019-L1024) (the piece Phase 1 deliberately left in place) — from the per-shot path. With Single set once at session init and restored by `take_burst`, `take_picture` stays single-frame without any per-shot push.
 4. Reconcile the `get_camera_by_port` post-init drivemode line ([camera.py:1735](../../src/solareclipseworkbench/camera.py#L1735)) — leave the body in Single at init (session init now owns it), not `"Continuous high speed"`.
 
-### Phase 5: Tighten `_wait_for_capture_complete` poll (optional)
+### Phase 5: Fix `_wait_for_capture_complete` — **THE lead phase**
 
-**Goal:** a stuck event no longer stalls 3 s on Canon.
+**Goal:** cut the ~5.4 s/shot capture wait that is ~96% of per-shot time and the direct cause of dropped shots (it exceeds the 1.5 s lock guard). This is the whole performance story on the 70D.
+
+**Root cause (event-trace, 2026-05-31 — see Outcome).** The 70D **never emits `CAPTURE_COMPLETE`**. After a trigger it streams `UNKNOWN` property-change events, emits one **`FILE_ADDED` at ~1.2 s** (image committed to card = shot done), goes quiet ~2.3 s, and the loop — which only breaks on `CAPTURE_COMPLETE`/`TIMEOUT` — then blocks until the **first `TIMEOUT` at ~5.3 s**. That 5.3 s is the entire per-shot cost.
+
+**Fix (implemented):** add `GP_EVENT_FILE_ADDED` to the break condition in `_wait_for_capture_complete`. The loop now returns when the image lands on the card (~1.2 s) instead of waiting for a `CAPTURE_COMPLETE` that never comes. `timeout_ms` stays 3000 (real events return immediately; it only bounds the idle fallback, and a shorter value risks `TIMEOUT`-breaking during the ~0.6 s gap before `FILE_ADDED`). Applies to all bodies — it's a strict improvement (break on the earliest of CAPTURE_COMPLETE / FILE_ADDED / TIMEOUT); Sony is unaffected (it returns before this function).
 
 Steps:
-1. Use `timeout_ms=500, max_events=10` on the Canon wait path; leave Sony untouched.
+1. Break on `GP_EVENT_FILE_ADDED` as well as `CAPTURE_COMPLETE`/`TIMEOUT`. *(done)*
+2. Validate on the 70D with `perf_probe.py`: expect `take_picture` wall ≈1.2–1.5 s (was ~5.7 s), HDR ≈9 s (was 39 s), and **zero new `failed`/`-110` errors**.
 
 ### Phase 6: Outcome
 
@@ -285,11 +293,11 @@ Same camera, lens, card, and a charged battery each time. Commit it under `tests
 Criteria 1–3 require a physical Canon EOS 70D and are **hardware-gated**: they stay unchecked (pending a real-hardware run) while implementation proceeds against code review, the VirtualCamera simulator, and the existing test suite. Criteria 4–6 are validated without hardware.
 
 1. [x] _(hardware)_ `take_burst(duration=2.0)` on a 70D yields ≥10 frames (target ~14), confirmed by SD-card count. **Validated 2026-05-31: 18 frames** (vs. 1 before the fix), shutter burst audible; counted via `FILE_ADDED` events with `tests/bench/burst_check.py`.
-2. [ ] _(hardware)_ 18-shot corona at 2 s spacing runs with zero `dropped` events in the missed-shots CSV.
-3. [ ] _(hardware)_ 15-shot HDR completes in <10 s on a 70D.
-4. [ ] No regression on Nikon/Sony across all capture commands.
-5. [ ] Disconnect → reconnect → first shot applies all settings (cache-miss debug line present).
-6. [ ] Headless run works; existing tests pass; no new dependencies.
+2. [~] _(hardware)_ 18-shot corona at 2 s spacing runs with zero `dropped` events. **Strongly implied, not yet scheduler-tested:** per-shot is now ~1.26 s (was ~5.7 s), under both the 1.5 s drop guard and the 2 s cadence. A full APScheduler 2 s-spacing run is the remaining confirmation.
+3. [~] _(hardware)_ 15-shot HDR. **Target revised:** the original "<10 s" reflected the audit's wrong cost model. Measured per-shot floor is ~1.31 s (camera-bound RAW write), so a 15-shot HDR is **~20 s — down from ~84 s, a 4× win**, but not <10 s. <10 s is unreachable while we wait for `FILE_ADDED` (the safe completion signal).
+4. [ ] No regression on Nikon/Sony across all capture commands. *(Phase 5 `FILE_ADDED` break is a strict improvement for all bodies; Sony unaffected — not yet re-tested on Nikon/Sony hardware.)*
+5. [n/a] Disconnect → reconnect → first shot applies all settings (cache-miss debug line). *(Phase 2 settings cache deprioritised by the measurement — no cache built.)*
+6. [x] Headless run works; existing tests pass (35 incl. 6 new); no new dependencies.
 
 ---
 
@@ -305,5 +313,18 @@ Criteria 1–3 require a physical Canon EOS 70D and are **hardware-gated**: they
 ## Outcome
 
 <!-- Filled in during/after implementation. -->
+
+**Measurement pass (2026-05-31, real 70D, `tests/bench/perf_probe.py`).** Per-op timing of the Canon capture path, median across 6 `take_picture` shots (corona-ladder shutters, constant ISO/aperture) + one 7-shot `take_hdr`:
+
+| Command | get_config | set_config (pushes) | wait_for_event | wall |
+|---------|-----------|---------------------|----------------|------|
+| `take_picture` (median/shot) | ~24 ms | ~57 ms (2 calls) | **~5460 ms (26 calls)** | ~5706 ms |
+| `take_hdr` (per shot, /7) | ~5 ms | ~36 ms | **~5412 ms** | ~5592 ms |
+
+**Verdict:** the capture wait is ~96% of per-shot time; config pushes are ~1.4%. This **inverts the audit's plan**. Re-prioritisation: **Phase 5 (wait) is the lead and effectively the whole win; Phase 2 (cache) deprioritised (~1% saving); Phase 3 (HDR push) dropped.** The ~5.7 s/shot floor is also the direct cause of dropped shots (it exceeds the 1.5 s `_MAX_LOCK_WAIT_S` guard).
+
+**Event-trace (2026-05-31, `tests/bench/event_trace.py`) — root cause of the 5.4 s wait.** One `trigger_capture`, then every `wait_for_event` logged: 23 `UNKNOWN`, 1 `FILE_ADDED` (at **+1177 ms** — image on card), 3 `TIMEOUT`, and **zero `CAPTURE_COMPLETE`**. The 70D never sends `CAPTURE_COMPLETE`; the loop (break only on CAPTURE_COMPLETE/TIMEOUT) therefore blocks until the first `TIMEOUT` at **+5340 ms** — matching the ~5.46 s measured. **Phase 5 fix:** also break on `GP_EVENT_FILE_ADDED`, so the wait ends when the image lands on the card (~1.2 s) instead of at the 5.3 s timeout.
+
+**Phase 5 (wait fix) — landed & hardware-validated (2026-05-31).** Added `GP_EVENT_FILE_ADDED` to the `_wait_for_capture_complete` break condition. On the 70D, `take_picture` median wall **5706 ms → 1259 ms** (wait 5460 → 1087 ms) and a 7-shot `take_hdr` **39.1 s → 9.2 s** — ~4.5× — with no `-110`/failed errors and all frames captured. The residual ~1.1 s/shot is the camera-bound RAW-write time (`FILE_ADDED`), the real floor. This is the single highest-impact change in the spec and also resolves the dropped-shot cadence problem (per-shot now < the 1.5 s lock guard). **Phases 2 and 3 are intentionally not implemented** (measurement showed config pushes are ~1.4% of per-shot time); they remain documented as deprioritised/dropped. Bench tools `tests/bench/perf_probe.py` (per-op timing) and `tests/bench/event_trace.py` (event timeline) added.
 
 **Phase 1 (burst fix) — landed & hardware-validated (2026-05-31).** Added `_find_drive_mode_choice` and reworked the `take_burst` Canon branch to switch to `Continuous high speed` for the burst and restore `Single` in a `finally`. *Deviation from the audit's split:* the `drivemode=Single` removal from `__adapt_camera_settings`, the `take_picture` defensive set, and the `get_camera_by_port` init reconcile were **not** done here — they'd add a per-shot round-trip — and moved to Phase 4 (session init). `__adapt` keeps its batched Single (free, deterministic for non-burst commands); `take_burst` overrides it. Result on a real 70D: a 2.0 s burst produced **18 frames** (was 1). Added `tests/test_camera_drive_mode.py` (6 hardware-free helper tests) and `tests/bench/burst_check.py` (manual FILE_ADDED-counting harness).
