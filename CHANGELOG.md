@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Fixed
+- **Canon `take_burst` now produces a real burst**: it previously fired a single
+  frame regardless of duration, because the shared settings adapter forced the camera
+  into Single drive mode before the shutter was held down. `take_burst` now switches
+  Canon bodies to their fastest continuous drive mode for the burst and restores Single
+  afterwards. On an EOS 70D a 2-second burst now yields ~18 frames (was 1).
+- **Much faster Canon capture, and dropped shots eliminated at typical cadences**:
+  `take_picture` and `take_hdr` no longer stall ~5 s per shot on Canon bodies that
+  never emit a capture-complete event (e.g. the EOS 70D). The capture wait now also
+  finishes when the frame is written to the card, cutting per-shot time from ~5.7 s to
+  ~1.3 s (a 7-shot HDR drops from ~39 s to ~9 s). Because each shot now completes well
+  within the scheduler's timing guard, shots spaced ~2 s apart are no longer dropped.
+
+### Changed
+- **Canon drive mode now defaults to Single at camera initialisation** instead of an
+  immediately-overridden "Continuous high speed". Per-command code owns the drive mode
+  (`take_burst` opts into continuous for the burst, then restores Single).
+
 ## [1.9.2] - 2026-04-25
 
 ### Fixed

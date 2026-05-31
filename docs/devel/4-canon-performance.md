@@ -4,8 +4,12 @@ issue: 4
 pr: 5
 completed:
   - "Phase 1: Fix the Canon burst (continuous drive in take_burst)"
-  - "Phase 5: Fix _wait_for_capture_complete (break on FILE_ADDED)"
+  - "Phase 2: Per-camera settings cache (dropped — measurement showed ~1.4% gain)"
+  - "Phase 3: take_hdr set_single_config (dropped — measurement)"
   - "Phase 4: Init drive-mode cleanup (reduced scope)"
+  - "Phase 5: Fix _wait_for_capture_complete (break on FILE_ADDED)"
+  - "Phase 6: Outcome"
+  - "Phase 7: Documentation"
 ---
 
 # Canon Capture Performance — Design Document
