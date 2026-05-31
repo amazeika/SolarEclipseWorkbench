@@ -1581,6 +1581,14 @@ def take_hdr(camera: Camera, camera_settings: CameraSettings, stops: int) -> Non
     for idx in indices:
         speed = choices[idx]
         try:
+            # Clear any events still queued from the previous shot before triggering
+            # the next one.  _wait_for_capture_complete breaks on the first
+            # GP_EVENT_FILE_ADDED; a body that writes more than one file per shot
+            # (e.g. RAW+JPEG) can leave a second FILE_ADDED queued past the drain
+            # window.  Draining here ensures the wait below only sees *this* shot's
+            # completion event, so it can't break early and let the following
+            # set_config race an in-progress capture.  Cheap (~50 ms) when quiet.
+            _drain_camera_events(target, context, timeout_ms=50, max_events=30)
             gp.gp_widget_set_value(speed_widget, speed)
             gp.gp_camera_set_config(target, config, context)
             gp.check_result(gp.gp_camera_trigger_capture(target, context))
