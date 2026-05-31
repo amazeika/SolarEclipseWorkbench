@@ -22,8 +22,8 @@ import geopandas
 import numpy as np
 import pandas as pd
 import pytz
-from PyQt6.QtCore import QTimer, QRect, Qt, QAbstractTableModel, QModelIndex, QSettings, pyqtSignal
-from PyQt6.QtGui import QIcon, QAction, QIntValidator, QCloseEvent, QPixmap, QImage, QPainter, QPen, QColor
+from PyQt6.QtCore import QTimer, QRect, Qt, QAbstractTableModel, QModelIndex, QSettings, pyqtSignal, QObject
+from PyQt6.QtGui import QIcon, QAction, QIntValidator, QCloseEvent, QPixmap, QImage, QPainter, QPen, QColor, QBrush
 from PyQt6.QtWidgets import QMainWindow, QApplication, QWidget, QFrame, QLabel, QHBoxLayout, QVBoxLayout, QGridLayout, \
     QGroupBox, QComboBox, QPushButton, QLineEdit, QFileDialog, QScrollArea, QTableView, QMessageBox
 from PyQt6 import QtWidgets
@@ -43,6 +43,8 @@ from solareclipseworkbench.camera import get_camera_dict, get_battery_level, get
     get_shooting_mode, get_focus_mode, set_time, CameraSettings, LiveViewThread, \
     sony_save_destination_needs_downloader
 from solareclipseworkbench.observer import Observer, Observable
+from solareclipseworkbench.shot_events import BUS, ShotEvent, ShotOutcome
+from solareclipseworkbench import shot_log
 from solareclipseworkbench.qt_utils import apply_system_color_scheme
 from solareclipseworkbench.reference_moments import calculate_reference_moments, ReferenceMomentInfo
 from solareclipseworkbench.location_ui import ConfigManager, LocationWidget
@@ -272,6 +274,26 @@ class SolarEclipseModel:
         return warnings
 
 
+class _ShotEventBridge(QObject):
+    """Marshal background-thread shot events onto the GUI thread.
+
+    ``BUS.publish`` runs on the scheduler/camera thread; this bridge subscribes
+    a trivial callback that re-emits the event as a Qt signal. Because the
+    bridge has GUI-thread affinity while the callback fires on the camera
+    thread, the signal uses a queued connection, so the actual widget updates
+    happen on the GUI thread and no slow work runs on the camera thread.
+    """
+
+    event = pyqtSignal(object)  # ShotEvent
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        BUS.subscribe(self._on_bus_event)
+
+    def _on_bus_event(self, evt: ShotEvent):
+        self.event.emit(evt)
+
+
 class SolarEclipseView(QMainWindow, Observable):
     """ View for the Solar Eclipse Workbench UI in the MVC pattern. """
 
@@ -433,6 +455,37 @@ class SolarEclipseView(QMainWindow, Observable):
         self.sony_reminder_label.setVisible(False)
 
         self.init_ui()
+
+        # Missed-shots indicator: status-bar counter + bridge for shot events.
+        self._missed_counts: dict[str, int] = {}
+        self._missed_label = QLabel("Missed: 0")
+        self._missed_label.setStyleSheet("QLabel { padding: 0 8px; }")
+        self.statusBar().addPermanentWidget(self._missed_label)
+        self._shot_bridge = _ShotEventBridge(self)
+        self._shot_bridge.event.connect(self._on_shot_event)
+
+    def _on_shot_event(self, evt: ShotEvent):
+        """Handle a shot event on the GUI thread (queued from the camera thread)."""
+        if evt.outcome == ShotOutcome.DROPPED:
+            # The current jobs model lives on the table (set via setModel), which also
+            # handles schedule rebuilds. The view has no controller back-reference.
+            model = self.jobs_table.model()
+            if isinstance(model, JobsTableModel):
+                model.mark_missed(evt.camera_name, evt.command, evt.scheduled_at)
+            self._missed_counts[evt.camera_name] = self._missed_counts.get(evt.camera_name, 0) + 1
+            self._update_missed_label()
+
+    def _update_missed_label(self):
+        total = sum(self._missed_counts.values())
+        if total:
+            parts = ", ".join(f"{cam}: {n}" for cam, n in self._missed_counts.items())
+            self._missed_label.setText(f"Missed: {total} ({parts})")
+            self._missed_label.setStyleSheet(
+                "QLabel { padding: 0 8px; color: white; background: #c0392b; }"
+            )
+        else:
+            self._missed_label.setText("Missed: 0")
+            self._missed_label.setStyleSheet("QLabel { padding: 0 8px; }")
 
     def save_settings(self):
         """ Save the settings.
@@ -886,6 +939,7 @@ class SolarEclipseView(QMainWindow, Observable):
             - close_event: Event that occurs when the UI window is closed
         """
 
+        shot_log.write_report()
         self.notify_observers(close_event)
 
 
@@ -1200,6 +1254,7 @@ class SolarEclipseController(Observer):
             try:
                 if self.scheduler:
                     self.scheduler.shutdown()
+                    shot_log.write_report()  # flush the shot report at end of run
                     self.jobs_model.clear_jobs_overview()
 
                     self.view.camera_action.setEnabled(True)
@@ -2546,6 +2601,7 @@ class JobsTableModel(QAbstractTableModel, Observable):
         super().__init__()
         self.controller = controller
         self.time_format = self.controller.view.time_format
+        self._missed_rows: set[int] = set()
 
         from solareclipseworkbench.reference_moments import _find_timezone
         timezone = pytz.timezone(_find_timezone(self.controller.model.longitude, self.controller.model.latitude))
@@ -2684,6 +2740,40 @@ class JobsTableModel(QAbstractTableModel, Observable):
             if orientation == Qt.Orientation.Vertical:
                 return str(self._data.index[section])
 
+    def mark_missed(self, camera_name: str, command: str, scheduled_at: datetime.datetime):
+        """Flag the scheduled-jobs row matching a dropped shot so it renders red.
+
+        Matches on command + camera name appearing in the COMMAND cell and an
+        execution time within +/-2 s of ``scheduled_at`` (the closest unmarked
+        such row, so repeated drops at the same instant mark distinct rows).
+        """
+        best_row = None
+        best_delta = None
+        for row in range(len(self.execution_times_utc_as_datetime)):
+            if row in self._missed_rows:
+                continue
+            exec_utc = self.execution_times_utc_as_datetime[row]
+            if exec_utc is None:
+                continue
+            delta = abs((scheduled_at - exec_utc).total_seconds())
+            if delta > 2:
+                continue
+            command_cell = str(self._data.loc[row, JobsTableColumnNames.COMMAND.value])
+            if command not in command_cell or camera_name not in command_cell:
+                continue
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                best_row = row
+
+        if best_row is not None:
+            self._missed_rows.add(best_row)
+            top_left = self.index(best_row, 0)
+            bottom_right = self.index(best_row, self.columnCount(None) - 1)
+            self.dataChanged.emit(
+                top_left, bottom_right,
+                [Qt.ItemDataRole.BackgroundRole, Qt.ItemDataRole.ForegroundRole],
+            )
+
     def data(self, index: QModelIndex, role):
         """ Formatting of the data to display. """
 
@@ -2695,6 +2785,16 @@ class JobsTableModel(QAbstractTableModel, Observable):
             if isinstance(value, datetime.datetime):
                 return format_time(value, self.controller.view.time_format)
             return value
+
+        if role == Qt.ItemDataRole.BackgroundRole:
+            if index.row() in self._missed_rows:
+                return QBrush(QColor("#c0392b"))
+            return None
+
+        if role == Qt.ItemDataRole.ForegroundRole:
+            if index.row() in self._missed_rows:
+                return QBrush(QColor("white"))
+            return None
 
         if role == Qt.ItemDataRole.TextAlignmentRole:
             if index.column() == 0:
@@ -2727,6 +2827,10 @@ class QJobsTableView(QTableView):
 def main():
     time_string = time.strftime("%Y%m%d-%H%M%S")
     logging.basicConfig(filename=f'{time_string}.log', level=logging.DEBUG, format='%(asctime)s %(message)s')
+    # Write the shot report alongside the application log (see the /tmp log configured
+    # at module import) as /tmp/<timestamp>.shots.csv.
+    log_dir = os.path.dirname("/tmp/solareclipseworkbench.log")
+    shot_log.set_run_basename(os.path.join(log_dir, time_string))
     # Also log to stdout so users see debug output in terminal
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG)
