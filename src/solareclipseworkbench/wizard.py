@@ -1601,16 +1601,35 @@ class SummaryPage(QWizardPage):
                     lines.append("# REMEMBER TO REPLACE SOLAR FILTER after C3!")
                     lines.append("#")
                     
-                    # The post-C3 contact bursts generated below (C3 diamond ring at
-                    # +1s, Baily's beads at +8s) each hold the camera through a
-                    # multi-second card flush on DSLR bodies (~9s on a 70D, so the
-                    # camera is busy until ~C3+17s).  Start the partial sequence only
-                    # after the last of them (the +8s beads burst) has flushed, or the
-                    # first partial shot lands in that window and is dropped.
+                    # The post-C3 contact bursts generated further below hold the
+                    # camera through their card flush (the burst keeps the USB lock
+                    # until every frame is written), so a partial shot scheduled into
+                    # that flush window is dropped.  Start the partial sequence only
+                    # once the *last* post-C3 burst — the Baily's beads burst — is
+                    # done.  The camera is busy from when that burst starts until it
+                    # finishes flushing:
+                    #
+                    #   POST_C3_BEADS_OFFSET_S  the beads burst fires at C3+8s
+                    #                           (must match the take_burst call below)
+                    #   BURST_SHUTTER_S         Canon holds the shutter for the burst's
+                    #                           2s "duration"; capture ends ~C3+10s
+                    #   BURST_FLUSH_HEADROOM_S  the body then writes the ~10-16 frames
+                    #                           to the card while still holding the
+                    #                           lock — measured ~9s on a 70D, padded to
+                    #                           15s for a fuller/slower card or RAW
+                    #
+                    # => first partial at ~C3+25s (camera actually free ~C3+17s).  The
+                    # pad is empirical, not exact: flush time scales with frame count,
+                    # file format and card speed, so an unusually slow card could still
+                    # cost one early partial.
+                    POST_C3_BEADS_OFFSET_S = 8.0
+                    BURST_SHUTTER_S = 2.0
+                    BURST_FLUSH_HEADROOM_S = 15.0
                     c3_partial_start = buffer_seconds
                     if wizard.field('diamond') or wizard.field('bailys'):
-                        # +8s beads burst + ~2s burst + ~15s flush headroom => ~C3+25s
-                        c3_partial_start = max(buffer_seconds, 8.0 + 2.0 + 15.0)
+                        burst_clear_s = (POST_C3_BEADS_OFFSET_S + BURST_SHUTTER_S
+                                         + BURST_FLUSH_HEADROOM_S)
+                        c3_partial_start = max(buffer_seconds, burst_clear_s)
                     c3_start_time = c3_time + timedelta(seconds=c3_partial_start)
                     c4_end_time = c4_time - timedelta(seconds=buffer_seconds)
                     c3_c4_duration = (c4_end_time - c3_start_time).total_seconds()
