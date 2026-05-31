@@ -32,6 +32,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   lock until the body has flushed *all* burst frames and the USB interface is idle (a full
   no-event wait), rather than breaking on the first frame as a single shot would — that
   early break still released the lock mid-flush and is what allowed the `-110` through.
+- **First C3-C4 partial shot no longer dropped by the Post-C3 beads burst**: because a
+  burst now correctly holds the camera through its card flush (~9 s on a 70D), the C3-C4
+  partial sequence starting at C3+10 s landed in the +8 s beads-burst flush window and was
+  dropped. When the diamond/Baily's bursts are enabled the partial sequence now starts
+  after they have flushed (~C3+25 s) so the first partial fires; with no post-C3 bursts it
+  keeps the original C3+10 s start.
 - **Missed-shot indicator now counts failed shots**: the status-bar counter and red row
   highlight previously reacted only to *dropped* shots; a shot that was attempted but
   errored (`FAILED`, e.g. `-110 I/O in progress`) was invisible. Both outcomes now count.

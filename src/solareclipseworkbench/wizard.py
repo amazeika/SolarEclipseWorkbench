@@ -1601,10 +1601,20 @@ class SummaryPage(QWizardPage):
                     lines.append("# REMEMBER TO REPLACE SOLAR FILTER after C3!")
                     lines.append("#")
                     
-                    c3_c4_duration = (c4_time - c3_time).total_seconds() - 2 * buffer_seconds
-                    c3_start_time = c3_time + timedelta(seconds=buffer_seconds)
+                    # The post-C3 contact bursts generated below (C3 diamond ring at
+                    # +1s, Baily's beads at +8s) each hold the camera through a
+                    # multi-second card flush on DSLR bodies (~9s on a 70D, so the
+                    # camera is busy until ~C3+17s).  Start the partial sequence only
+                    # after the last of them (the +8s beads burst) has flushed, or the
+                    # first partial shot lands in that window and is dropped.
+                    c3_partial_start = buffer_seconds
+                    if wizard.field('diamond') or wizard.field('bailys'):
+                        # +8s beads burst + ~2s burst + ~15s flush headroom => ~C3+25s
+                        c3_partial_start = max(buffer_seconds, 8.0 + 2.0 + 15.0)
+                    c3_start_time = c3_time + timedelta(seconds=c3_partial_start)
                     c4_end_time = c4_time - timedelta(seconds=buffer_seconds)
-                    
+                    c3_c4_duration = (c4_end_time - c3_start_time).total_seconds()
+
                     if wizard.field('partial_magnitude'):
                         magnitude_interval = wizard.field('magnitude_value')
                         if magnitude_interval is None or magnitude_interval <= 0:
