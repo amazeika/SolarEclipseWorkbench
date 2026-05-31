@@ -1868,11 +1868,24 @@ class SummaryPage(QWizardPage):
                         if wizard.field('earthshine'):
                             earthshine_shutter, earthshine_iso, earthshine_aperture = get_adjusted_exposure('earthshine', '7', preferred_iso, aperture, max_iso=iso_max, min_aperture=aperture)
                             earthshine_exposure = parse_shutter_speed(earthshine_shutter)
-                            # Earthshine shots at C2+30s and C3-30s
-                            # Each occupies: start_time to start_time + exposure + 2s buffer
+                            # Earthshine shots at C2+30s and C3-30s.  Each occupies its
+                            # exposure plus ~2s of set-config/trigger/wait overhead.  A
+                            # guard band widens the blocked window on both sides so a
+                            # corona shot is never scheduled into the earthshine's busy
+                            # span.  The late shot is anchored to C3 while corona shots are
+                            # anchored to C2, so any gap between the predicted and actual
+                            # totality duration shifts it relative to the corona sequence;
+                            # the guard absorbs a few seconds of that drift (without it, a
+                            # ~2s slot collapses and the adjacent corona shots get dropped
+                            # by the runtime USB-lock guard).
+                            earthshine_guard = 3.0
                             earthshine_times = [
-                                (30.0, 30.0 + earthshine_exposure + 2.0),  # C2+30s shot
-                                (totality_duration - 30.0, totality_duration - 30.0 + earthshine_exposure + 2.0)  # C3-30s shot
+                                # C2+30s shot
+                                (30.0 - earthshine_guard,
+                                 30.0 + earthshine_exposure + 2.0 + earthshine_guard),
+                                # C3-30s shot
+                                (totality_duration - 30.0 - earthshine_guard,
+                                 totality_duration - 30.0 + earthshine_exposure + 2.0 + earthshine_guard),
                             ]
 
                         # Calculate HDR burst exclusion window if HDR is enabled (fired at MAX-10s)
