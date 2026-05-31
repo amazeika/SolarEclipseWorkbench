@@ -13,8 +13,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   writes a per-run CSV report of every shot's outcome (fired / dropped / failed)
   alongside the log. The drop behaviour itself is unchanged; this only makes missed
   shots visible during the run instead of requiring a log trawl afterwards.
+- **Observing location is now loaded from the script**: when a script is loaded, SEW
+  reads the `# Coordinates:` header and sets the observing location from it, recomputing
+  the reference moments (C1–C4) for those exact coordinates. While a script is loaded it
+  owns the coordinates — the Location pop-up shows them read-only and no longer overwrites
+  them (the GPS time offset is still applied), so a run can no longer use coordinates that
+  contradict the loaded script. Previously the runtime location was set independently of
+  the wizard that generated the script, and the two could silently diverge — shifting the
+  C3-anchored contact times and dropping shots whose offsets assumed the script's totality
+  duration.
 
 ### Fixed
+- **Canon `take_burst` no longer makes the next shot fail with `-110`**: the Canon burst
+  path released the USB lock without waiting for the body to finish writing the burst
+  frames (unlike `take_picture` / `take_hdr`), so a shot scheduled shortly after a burst
+  could acquire the lock mid-transfer and fail with `GPhoto2Error: [-110] I/O in progress`
+  (e.g. the C3-C4 #1 frame ~2 s after the Post-C3 beads burst). The burst now waits for
+  capture-complete and drains queued events before releasing the lock.
+- **Corona shots no longer dropped next to the late earthshine**: the wizard's corona/
+  earthshine de-confliction left only a ~2 s gap around the C3-anchored late earthshine
+  exposure, with no margin for drift. A guard band now widens both earthshine exclusion
+  windows so corona shots keep a generous gap around the long earthshine exposures.
+- **Missed-shot indicator now counts failed shots**: the status-bar counter and red row
+  highlight previously reacted only to *dropped* shots; a shot that was attempted but
+  errored (`FAILED`, e.g. `-110 I/O in progress`) was invisible. Both outcomes now count.
 - **Canon `take_burst` now produces a real burst**: it previously fired a single
   frame regardless of duration, because the shared settings adapter forced the camera
   into Single drive mode before the shutter was held down. `take_burst` now switches

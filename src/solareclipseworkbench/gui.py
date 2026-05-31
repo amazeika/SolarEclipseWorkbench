@@ -47,6 +47,7 @@ from solareclipseworkbench.shot_events import BUS, ShotEvent, ShotOutcome
 from solareclipseworkbench import shot_log
 from solareclipseworkbench.qt_utils import apply_system_color_scheme
 from solareclipseworkbench.reference_moments import calculate_reference_moments, ReferenceMomentInfo
+from solareclipseworkbench.scripts import parse_location_from_script
 from solareclipseworkbench.location_ui import ConfigManager, LocationWidget
 from solareclipseworkbench.constants import SUN_RADIUS, MOON_RADIUS
 
@@ -466,7 +467,10 @@ class SolarEclipseView(QMainWindow, Observable):
 
     def _on_shot_event(self, evt: ShotEvent):
         """Handle a shot event on the GUI thread (queued from the camera thread)."""
-        if evt.outcome == ShotOutcome.DROPPED:
+        # A DROPPED shot never fired (USB still busy); a FAILED shot was attempted
+        # but errored (e.g. -110 I/O in progress). Both mean the planned frame was
+        # not captured, so both count toward the missed indicator.
+        if evt.outcome in (ShotOutcome.DROPPED, ShotOutcome.FAILED):
             # The current jobs model lives on the table (set via setModel), which also
             # handles schedule rebuilds. The view has no controller back-reference.
             model = self.jobs_table.model()
@@ -971,6 +975,13 @@ class SolarEclipseController(Observer):
         self.sim_reference_moment: Union[str, None] = None
         self.sim_offset_minutes: Union[int, None] = None
 
+        # True once a script has been loaded and scheduled. While set, the
+        # observing coordinates are owned by the script (loaded from its header)
+        # and the Location pop-up will not overwrite them -- only the GPS time
+        # offset is still accepted. Reset on Stop. This prevents running with
+        # coordinates that contradict the loaded script.
+        self.script_loaded: bool = False
+
         self.location_popup: Union[LocationPopup, None] = None
         self.eclipse_popup: Union[EclipsePopup, None] = None
         self.simulator_popup: Union[SimulatorPopup, None] = None
@@ -1071,14 +1082,31 @@ class SolarEclipseController(Observer):
         """
 
         if isinstance(changed_object, LocationPopup):
+            # The GPS–computer time offset is orthogonal to coordinates and must
+            # always be accepted (it keeps the shutter firing at the correct
+            # wall-clock instant), even when a script owns the coordinates.
+            self.model.gps_time_offset = changed_object.location_widget.gps_time_offset
+
+            # While a script is loaded its header coordinates are authoritative:
+            # the schedule was already built from them, so accepting different
+            # coordinates here would only desync the display from the run.
+            if self.script_loaded:
+                QMessageBox.information(
+                    self.view,
+                    "Location locked to script",
+                    "A script is loaded, so the observing coordinates are fixed to "
+                    "the location in its header.\n\n"
+                    "To observe from a different location, Stop the run and load a "
+                    "script generated for that location.\n\n"
+                    "(The GPS time offset was still applied.)"
+                )
+                return
+
             longitude = float(changed_object.longitude.text())
             latitude = float(changed_object.latitude.text())
             altitude = float(changed_object.altitude.text())
 
             self.model.set_position(longitude, latitude, altitude)
-
-            # Carry over any GPS–computer time offset measured by the USB GPS
-            self.model.gps_time_offset = changed_object.location_widget.gps_time_offset
 
             self.view.longitude_label.setText(str(longitude))
             self.view.latitude_label.setText(str(latitude))
@@ -1195,6 +1223,37 @@ class SolarEclipseController(Observer):
             if not filename:
                 return  # user cancelled the dialog
 
+            # Load the observing location embedded in the script header so the
+            # runtime reference moments (C2/C3, ...) are computed for the exact
+            # coordinates the script was generated for.  Otherwise the app would
+            # schedule against whatever location was last loaded in the main
+            # window, which can differ from the wizard's -- shifting the contact
+            # times relative to the script's fixed C2-/C3-anchored offsets and
+            # dropping shots whose timing assumed the script's totality duration.
+            if os.path.exists(filename):
+                location = parse_location_from_script(filename)
+                if location is not None:
+                    longitude, latitude, altitude = location
+                    changed = (longitude, latitude, altitude) != (
+                        self.model.longitude, self.model.latitude, self.model.altitude)
+                    self.set_location(longitude, latitude, altitude)
+                    if self.model.eclipse_date is not None:
+                        try:
+                            self.set_reference_moments()
+                        except Exception:
+                            logging.exception(
+                                "Could not recompute reference moments for script location")
+                    if changed:
+                        QMessageBox.information(
+                            self.view,
+                            "Location loaded from script",
+                            "The observing location was set from the script header:\n\n"
+                            f"  latitude   {latitude}°\n"
+                            f"  longitude  {longitude}°\n"
+                            f"  altitude   {altitude} m\n\n"
+                            "Reference moments were recomputed for these coordinates."
+                        )
+
             if not self.model.reference_moments:
                 QMessageBox.warning(
                     self.view,
@@ -1223,6 +1282,10 @@ class SolarEclipseController(Observer):
                                             self.model.camera_overview.camera_overview_dict, self,
                                             self.sim_reference_moment, self.sim_offset_minutes,
                                             gps_time_offset=self.model.gps_time_offset)
+
+                # The script now owns the observing coordinates (loaded from its
+                # header above); lock the Location pop-up against overwriting them.
+                self.script_loaded = True
 
                 self.jobs_model = JobsTableModel(self.scheduler, self)
                 self.view.jobs_table.setModel(self.jobs_model)
@@ -1258,6 +1321,9 @@ class SolarEclipseController(Observer):
                     self.jobs_model.clear_jobs_overview()
 
                     self.view.camera_action.setEnabled(True)
+                    # Run over: coordinates are no longer script-owned, so the
+                    # Location pop-up may set them again for planning.
+                    self.script_loaded = False
             except SchedulerNotRunningError:
                 # Scheduler not running
                 pass
@@ -1505,6 +1571,28 @@ class LocationPopup(QWidget, Observable):
                 model.longitude, model.latitude, model.altitude
             )
         layout.addWidget(self.location_widget)
+
+        # When a script is loaded it owns the coordinates: show the script's
+        # location and make the coordinate fields read-only so they can't be
+        # edited into a state that disagrees with the running schedule. GPS
+        # (including the time-offset) and the saved-locations/search controls
+        # stay usable; any coordinates they propose are ignored on OK while a
+        # script is loaded (see SolarEclipseController.update).
+        if getattr(observer, "script_loaded", False):
+            if model.longitude is not None:
+                self.location_widget.set_coordinates(
+                    model.longitude, model.latitude, model.altitude
+                )
+            for edit in (self.location_widget.longitude_edit,
+                         self.location_widget.latitude_edit,
+                         self.location_widget.altitude_edit):
+                edit.setReadOnly(True)
+            locked_note = QLabel(
+                "Coordinates are set by the loaded script. Stop the run to change them."
+            )
+            locked_note.setWordWrap(True)
+            locked_note.setStyleSheet("QLabel { color: #c0392b; }")
+            layout.addWidget(locked_note)
 
         self.location_plot = LocationPlot()
         layout.addWidget(self.location_plot)

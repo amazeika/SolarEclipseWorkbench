@@ -1,7 +1,52 @@
 import io
 import csv
 import logging
+import re
 from datetime import datetime, timedelta
+
+_COORD_NUMBER_RE = re.compile(r'[-+]?\d+(?:\.\d+)?')
+
+
+def parse_location_from_script(filename) -> tuple | None:
+    """Parse the observing location from a generated script's header.
+
+    The wizard writes a header line of the form::
+
+        # Coordinates: <latitude>° N, <longitude>° E, <altitude> m
+
+    The numeric values are already signed (the N/E labels are fixed text), so
+    only the three numbers are read. Only the leading comment block is scanned;
+    the first non-comment, non-blank line stops the search so command lines are
+    never misread as coordinates.
+
+    Returns:
+        ``(longitude, latitude, altitude)`` as floats -- ordered to match
+        ``SolarEclipseController.set_location`` -- or ``None`` when no usable
+        Coordinates header is found.
+    """
+    try:
+        with open(filename, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if not stripped.startswith("#"):
+                    break  # past the header; stop before the command lines
+                if "Coordinates:" not in stripped:
+                    continue
+                after = stripped.split("Coordinates:", 1)[1]
+                numbers = _COORD_NUMBER_RE.findall(after)
+                if len(numbers) >= 3:
+                    latitude, longitude, altitude = (
+                        float(numbers[0]), float(numbers[1]), float(numbers[2]))
+                    return longitude, latitude, altitude
+                logging.warning(
+                    "Coordinates header found but could not be parsed: %s", stripped)
+                return None
+    except OSError:
+        logging.warning("Could not read script for location header: %s", filename)
+    return None
+
 
 def convert_command(line, ref_moment, sign, time_delta, extra_comment, output_file) -> io.StringIO:
     # Use CSV parser to properly handle quoted fields with commas
