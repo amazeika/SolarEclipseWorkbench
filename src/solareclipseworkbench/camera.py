@@ -750,7 +750,7 @@ def _wait_for_capture_complete(target, context, timeout_ms: int = 3000, max_even
                   broke_on, trailing)
 
 
-def _wait_for_burst_complete(target, context, idle_timeout_ms: int = 600, max_waits: int = 60) -> None:
+def _wait_for_burst_complete(target, context, idle_timeout_ms: int = 600, max_waits: int = 300) -> None:
     """Block until the camera's USB interface is idle after a burst.
 
     Unlike a single shot, a burst writes many frames that the body flushes to
@@ -775,7 +775,7 @@ def _wait_for_burst_complete(target, context, idle_timeout_ms: int = 600, max_wa
         max_waits:       Safety cap on iterations.
     """
     start = time.monotonic()
-    drained = 0
+    counts: dict[str, int] = {}
     reason = "max_waits"
     for _ in range(max_waits):
         try:
@@ -788,13 +788,19 @@ def _wait_for_burst_complete(target, context, idle_timeout_ms: int = 600, max_wa
         if event_type == gp.GP_EVENT_TIMEOUT:
             reason = "idle"
             break
-        drained += 1
-    # The discriminator for "why is this burst slow": a count near one burst's
-    # frame total (~14 for a 2 s Canon burst) over a long elapsed time means slow
-    # card flush; a count far above that means a backlog of stale events left by
-    # earlier shots that this settle is draining. Logged at INFO (bursts are few).
-    logging.info("burst settle: drained %d event(s) over %.0f ms (stop: %s)",
-                 drained, (time.monotonic() - start) * 1000, reason)
+        name = _event_name(event_type)
+        counts[name] = counts.get(name, 0) + 1
+    # Diagnostic: the per-type histogram + elapsed time tells us what a slow
+    # burst is actually waiting on. A count near one burst's frame total
+    # (~14 for a 2 s Canon burst) spread over a long elapsed time => slow card
+    # flush; a flood of one type (e.g. UNKNOWN) => event spam, not real frames;
+    # stop=max_waits => we hit the cap before the queue went quiet (the lock may
+    # be released mid-flush). max_waits is raised for this diagnostic so we can
+    # observe the true count and whether idle is ever reached.
+    total = sum(counts.values())
+    histogram = " ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "-"
+    logging.info("burst settle: drained %d event(s) [%s] over %.0f ms (stop: %s)",
+                 total, histogram, (time.monotonic() - start) * 1000, reason)
 
 
 def _sony_drain_events(target, context) -> None:
