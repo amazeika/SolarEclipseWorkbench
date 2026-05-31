@@ -1,8 +1,9 @@
 ---
 status: in-progress
 issue: 4
-pr: null
-completed: []
+pr: 5
+completed:
+  - "Phase 1: Fix the Canon burst (continuous drive in take_burst)"
 ---
 
 # Canon Capture Performance — Design Document
@@ -94,22 +95,22 @@ The capture path stays gphoto2-only. We attack the four cost centres in order of
       ┌────────────────────────────────┼────────────────────────────────┐
       ▼                                ▼                                 ▼
  take_picture                     take_burst                         take_hdr
- set Single defensively      set Continuous (Canon) then         set_single_config
- (not in shared adapter)     restore Single in finally           per shutter step
+ stays Single (from          set Continuous (Canon) then         set_single_config
+ adapter → session init)     restore Single in finally           per shutter step
 ```
 
-### Drive-mode ownership (Phase 1)
+### Drive-mode ownership (Phases 1 & 4)
 
-Move `drivemode=Single` **out** of the shared `__adapt_camera_settings`. Single-frame mode becomes:
+Drive mode is owned per-command, not by the shared adapter:
 
-- A Canon session-init constant (Phase 4), so the camera defaults to Single, **and**
-- A defensive set at the start of `take_picture` only.
+- **`take_burst`** (Phase 1) explicitly sets the body's fastest continuous mode *after* `__adapt_camera_settings` returns, then restores Single in a `finally` block (so a mid-burst error still leaves the camera deterministic).
+- **Single-frame** for every other command stays cheap. In **Phase 1** it remains `__adapt_camera_settings`'s batched in-memory mutation — **zero extra round-trip**, since it rides the adapter's existing config push. In **Phase 4** it moves to a one-time **session-init constant** and the per-shot mutation is stripped from the adapter.
 
-`take_burst` (Canon) explicitly requests a continuous drive mode *after* `__adapt_camera_settings` returns, then restores Single in a `finally` block so the next `take_picture` is deterministic. A new helper `_find_drive_mode_choice(widget, want_continuous)` — modelled on the existing `_find_capturemode_choice` ([camera.py:528](../../src/solareclipseworkbench/camera.py#L528)) — resolves the body-specific choice string: prefer a continuous choice containing `"high"`, else the only/first continuous choice.
+A new helper `_find_drive_mode_choice(widget, want_continuous)` — modelled on the existing `_find_capturemode_choice` ([camera.py:528](../../src/solareclipseworkbench/camera.py#L528)) — resolves the body-specific choice string: for continuous, prefer a choice containing `"high"`, else the first `"continuous"`; for single, the first `"single"`.
 
-Confirmed against a real 70D, the `drivemode` widget exposes: `Single`, `Continuous high speed`, `Continuous low speed`, `Single silent`, `Continuous silent`, `Timer 10 sec`, `Timer 2 sec`. So `want_continuous=True` resolves to `"Continuous high speed"` (the "contains high" rule selects it over the other two continuous options) and the restore resolves to `"Single"` (index 0, ahead of `"Single silent"`). This matches the literal already hardcoded at [camera.py:1735](../../src/solareclipseworkbench/camera.py#L1735).
+Confirmed against a real 70D, the `drivemode` widget exposes: `Single`, `Continuous high speed`, `Continuous low speed`, `Single silent`, `Continuous silent`, `Timer 10 sec`, `Timer 2 sec`. So `want_continuous=True` resolves to `"Continuous high speed"` (the "contains high" rule selects it over the other two continuous options) and the restore resolves to `"Single"` (index 0, ahead of `"Single silent"`).
 
-This phase also reconciles the existing `get_camera_by_port` post-init `drivemode="Continuous high speed"` line ([camera.py:1735](../../src/solareclipseworkbench/camera.py#L1735)): with explicit per-command ownership, init should leave the camera in Single (deferred to Phase 4's session-init), not Continuous.
+> **Why Single stays in the adapter for Phase 1.** Removing it from `__adapt_camera_settings` and adding a *separate* `drivemode=Single` push to `take_picture` (the audit's original split) would add a full config round-trip to **every** single shot — exactly the overhead Phase 2 sets out to remove. The burst bug is fully fixed by `take_burst` overriding to continuous; the adapter's Single is harmless for burst (overridden) and free for everyone else. So the adapter cleanup + `get_camera_by_port` init reconcile (its current `drivemode="Continuous high speed"` at [camera.py:1735](../../src/solareclipseworkbench/camera.py#L1735) → Single) move to **Phase 4**, where eliminating per-shot drive-mode writes is the actual objective.
 
 ### Settings cache + single-widget push (Phase 2)
 
@@ -161,16 +162,15 @@ Phases mirror the audit's suggested PR layout. Each is independently testable; *
 
 > **Measurement gate.** Phase 1 (burst correctness) ships unconditionally. Phases 2–5 are **gated on a measurement pass**: instrument the Canon capture path with `perf_counter` around `get_config`, each config push, and `_wait_for_capture_complete`, then run one representative corona sequence on the 70D. Only build the perf phases the data justifies — if drops trace to the capture-wait stall, Phase 5 matters more than Phases 2–4; if they trace to config pushes, Phase 2 leads. Do not implement 2–5 blind on the audit's estimates.
 
-### Phase 1: Stop forcing Single drive mode in the shared adapter
+### Phase 1: Fix the Canon burst (continuous drive in `take_burst`)
 
 **Goal:** `take_burst` produces a real Canon burst; `take_picture` stays deterministically single-frame.
 
 Steps:
-1. Remove the `drivemode=Single` mutation from `__adapt_camera_settings` ([camera.py:1019-1024](../../src/solareclipseworkbench/camera.py#L1019-L1024)).
-2. Add a defensive `drivemode=Single` set at the start of the Canon path in `take_picture`.
-3. Add `_find_drive_mode_choice(widget, want_continuous)` helper.
-4. In `take_burst` Canon branch: set continuous drive after `__adapt_camera_settings`, wrap the Press/Release Full block in `try/finally`, restore Single in `finally`.
-5. Reconcile `get_camera_by_port` post-init drivemode line ([camera.py:1735](../../src/solareclipseworkbench/camera.py#L1735)) — leave the body in Single at init.
+1. Add the `_find_drive_mode_choice(widget, want_continuous)` helper, modelled on `_find_capturemode_choice`.
+2. In the `take_burst` Canon branch: after `__adapt_camera_settings`, set the body's fastest continuous drive via the helper and push; wrap the Press/Release Full block in `try`; restore Single in a `finally` (so a mid-burst error still leaves the camera deterministic).
+
+**Deviation from the audit's split (see Drive-mode ownership above):** removing `drivemode=Single` from `__adapt_camera_settings` and adding a defensive Single push to `take_picture` is *not* done here — it would add a per-shot round-trip. `__adapt` keeping its batched Single is harmless (burst overrides it) and free for non-burst commands, so the adapter cleanup + `get_camera_by_port` init reconcile move to **Phase 4**.
 
 ### Phase 2: Per-camera settings cache + `set_single_config`
 
@@ -193,14 +193,15 @@ Steps:
 Steps:
 1. Replace the full `gp_camera_set_config` in the HDR loop with `gp_camera_set_single_config(target, "shutterspeed", speed_widget, context)`.
 
-### Phase 4: One-time Canon session init
+### Phase 4: One-time Canon session init (+ remove per-shot drive-mode writes)
 
-**Goal:** move per-session constants out of the per-shot path.
+**Goal:** move per-session constants out of the per-shot path so the adapter stops re-writing them every shot.
 
 Steps:
 1. Add `ensure_session_initialised()` to `CanonCamera` with a `_session_initialised` flag (reset on connect/disconnect).
 2. Push `autoexposuremodedial=Manual`, `drivemode=Single`, `capturetarget`=card in one `set_config`.
-3. Call it at the top of `__adapt_camera_settings` for Canon; strip those constants from the per-shot path.
+3. Call it at the top of `__adapt_camera_settings` for Canon; strip those constants — including the `drivemode=Single` mutation at [camera.py:1019-1024](../../src/solareclipseworkbench/camera.py#L1019-L1024) (the piece Phase 1 deliberately left in place) — from the per-shot path. With Single set once at session init and restored by `take_burst`, `take_picture` stays single-frame without any per-shot push.
+4. Reconcile the `get_camera_by_port` post-init drivemode line ([camera.py:1735](../../src/solareclipseworkbench/camera.py#L1735)) — leave the body in Single at init (session init now owns it), not `"Continuous high speed"`.
 
 ### Phase 5: Tighten `_wait_for_capture_complete` poll (optional)
 
@@ -283,7 +284,7 @@ Same camera, lens, card, and a charged battery each time. Commit it under `tests
 
 Criteria 1–3 require a physical Canon EOS 70D and are **hardware-gated**: they stay unchecked (pending a real-hardware run) while implementation proceeds against code review, the VirtualCamera simulator, and the existing test suite. Criteria 4–6 are validated without hardware.
 
-1. [ ] _(hardware)_ `take_burst(duration=2.0)` on a 70D yields ≥10 frames (target ~14), confirmed by SD-card count.
+1. [x] _(hardware)_ `take_burst(duration=2.0)` on a 70D yields ≥10 frames (target ~14), confirmed by SD-card count. **Validated 2026-05-31: 18 frames** (vs. 1 before the fix), shutter burst audible; counted via `FILE_ADDED` events with `tests/bench/burst_check.py`.
 2. [ ] _(hardware)_ 18-shot corona at 2 s spacing runs with zero `dropped` events in the missed-shots CSV.
 3. [ ] _(hardware)_ 15-shot HDR completes in <10 s on a 70D.
 4. [ ] No regression on Nikon/Sony across all capture commands.
@@ -304,3 +305,5 @@ Criteria 1–3 require a physical Canon EOS 70D and are **hardware-gated**: they
 ## Outcome
 
 <!-- Filled in during/after implementation. -->
+
+**Phase 1 (burst fix) — landed & hardware-validated (2026-05-31).** Added `_find_drive_mode_choice` and reworked the `take_burst` Canon branch to switch to `Continuous high speed` for the burst and restore `Single` in a `finally`. *Deviation from the audit's split:* the `drivemode=Single` removal from `__adapt_camera_settings`, the `take_picture` defensive set, and the `get_camera_by_port` init reconcile were **not** done here — they'd add a per-shot round-trip — and moved to Phase 4 (session init). `__adapt` keeps its batched Single (free, deterministic for non-burst commands); `take_burst` overrides it. Result on a real 70D: a 2.0 s burst produced **18 frames** (was 1). Added `tests/test_camera_drive_mode.py` (6 hardware-free helper tests) and `tests/bench/burst_check.py` (manual FILE_ADDED-counting harness).

@@ -546,6 +546,38 @@ def _find_capturemode_choice(widget, want_continuous: bool = False) -> Optional[
     return None
 
 
+def _find_drive_mode_choice(widget, want_continuous: bool = False) -> Optional[str]:
+    """Return the ``drivemode`` choice string for single or continuous drive.
+
+    Canon bodies expose vendor-specific labels (e.g. ``'Single'``,
+    ``'Continuous high speed'``, ``'Continuous low speed'``, ``'Single silent'``).
+    For continuous drive, prefer a choice whose label contains ``'high'`` so a
+    burst fires at the body's fastest rate; otherwise fall back to the first
+    choice containing ``'continuous'``.  For single drive, return the first
+    choice containing ``'single'`` (which precedes variants such as
+    ``'Single silent'``).
+
+    Returns ``None`` when no matching choice is found so the caller can skip
+    setting the widget rather than sending an invalid value that would cause the
+    entire set_config transaction to fail.
+    """
+    try:
+        n = gp.check_result(gp.gp_widget_count_choices(widget))
+        choices = [gp.check_result(gp.gp_widget_get_choice(widget, i)) for i in range(n)]
+    except gphoto2.GPhoto2Error:
+        return None
+    if want_continuous:
+        continuous = [c for c in choices if 'continuous' in c.lower()]
+        for choice in continuous:
+            if 'high' in choice.lower():
+                return choice
+        return continuous[0] if continuous else None
+    for choice in choices:
+        if 'single' in choice.lower():
+            return choice
+    return None
+
+
 # Maximum time a scheduled job may wait for the camera USB lock before it is
 # considered too late to be worth taking.  Once a job has waited this long, the
 # camera is clearly busy with a previous shot and the queued shot would fire
@@ -1184,18 +1216,51 @@ def take_burst(camera: Camera, camera_settings: CameraSettings, duration: float)
 
     # Take picture for real cameras
     if getattr(camera, 'vendor', None) == 'Canon':
-        # Push the button
-        remote_release = gp.check_result(gp.gp_widget_get_child_by_name(config, 'eosremoterelease'))
-        gp.gp_widget_set_value(remote_release, "Press Full")
-        # set config
-        _set_gp_config(camera, config, context)
-        time.sleep(duration)
+        # __adapt_camera_settings leaves the camera in Single drive so that a
+        # plain take_picture fires exactly one frame.  A burst needs continuous
+        # drive: holding the shutter (Press Full) in Single yields a single frame
+        # regardless of duration.  Switch to the body's fastest continuous mode
+        # for the burst, then restore Single in the finally block so the next
+        # take_picture stays deterministic.
+        drive_w = None
+        try:
+            drive_w = gp.check_result(gp.gp_widget_get_child_by_name(config, 'drivemode'))
+            continuous = _find_drive_mode_choice(drive_w, want_continuous=True)
+            if continuous is not None:
+                gp.gp_widget_set_value(drive_w, continuous)
+                _set_gp_config(camera, config, context)
+                logging.debug('Set Canon drivemode to "%s" for burst', continuous)
+            else:
+                logging.warning('Canon burst: no continuous drivemode choice found; '
+                                'burst may fire only a single frame')
+        except gphoto2.GPhoto2Error as e:
+            logging.warning('Could not set Canon continuous drivemode for burst: %s', e)
 
-        # Release the button
-        remote_release = gp.check_result(gp.gp_widget_get_child_by_name(config, 'eosremoterelease'))
-        gp.gp_widget_set_value(remote_release, "Release Full")
-        # set config
-        _set_gp_config(camera, config, context)
+        try:
+            # Push the button
+            remote_release = gp.check_result(gp.gp_widget_get_child_by_name(config, 'eosremoterelease'))
+            gp.gp_widget_set_value(remote_release, "Press Full")
+            # set config
+            _set_gp_config(camera, config, context)
+            time.sleep(duration)
+
+            # Release the button
+            remote_release = gp.check_result(gp.gp_widget_get_child_by_name(config, 'eosremoterelease'))
+            gp.gp_widget_set_value(remote_release, "Release Full")
+            # set config
+            _set_gp_config(camera, config, context)
+        finally:
+            # Restore Single drive so a subsequent take_picture is deterministic,
+            # even if the burst raised partway through.
+            if drive_w is not None:
+                try:
+                    single = _find_drive_mode_choice(drive_w, want_continuous=False)
+                    if single is not None:
+                        gp.gp_widget_set_value(drive_w, single)
+                        _set_gp_config(camera, config, context)
+                        logging.debug('Restored Canon drivemode to "%s" after burst', single)
+                except gphoto2.GPhoto2Error as e:
+                    logging.warning('Could not restore Canon Single drivemode after burst: %s', e)
     elif getattr(camera, 'vendor', None) == 'Nikon':
         # Set capture mode to burst/continuous
         # Try different widget names (differs between DSLR and mirrorless models)
