@@ -24,14 +24,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   duration.
 
 ### Fixed
-- **Canon `take_burst` no longer makes the next shot fail with `-110`**: the Canon burst
-  path released the USB lock without waiting for the body to finish writing the burst
-  frames (unlike `take_picture` / `take_hdr`), so a shot scheduled shortly after a burst
-  could acquire the lock mid-transfer and fail with `GPhoto2Error: [-110] I/O in progress`
-  (e.g. the C3-C4 #1 frame ~2 s after the Post-C3 beads burst). The burst now holds the
-  lock until the body has flushed *all* burst frames and the USB interface is idle (a full
-  no-event wait), rather than breaking on the first frame as a single shot would — that
-  early break still released the lock mid-flush and is what allowed the `-110` through.
+- **First C3-C4 partial no longer fails with `-110`, without dropping the contact bursts**:
+  a shot scheduled ~2 s behind a burst collided with the burst's USB teardown and failed
+  with `GPhoto2Error: [-110] I/O in progress` — specifically Partial C3-C4 #1, which the
+  wizard placed at C3+10 s, only 2 s after the +8 s Baily's beads burst. The wizard now
+  starts the C3-C4 partial sequence a proven-safe gap after the last post-C3 burst (~C3+13 s,
+  matching the 5 s gap the C2 Prominences shot already uses successfully), so the first
+  partial fires. `take_burst` keeps releasing the USB lock immediately, letting the body
+  flush the burst frames in the background — an earlier attempt to hold the lock through the
+  multi-second RAW flush (~7 s for 15 frames on a 70D) was reverted because it dropped the
+  *adjacent* contact burst (the diamond ring / Baily's beads, only ~6-7 s apart).
 - **Missed-shot indicator now counts failed shots**: the status-bar counter and red row
   highlight previously reacted only to *dropped* shots; a shot that was attempted but
   errored (`FAILED`, e.g. `-110 I/O in progress`) was invisible. Both outcomes now count.

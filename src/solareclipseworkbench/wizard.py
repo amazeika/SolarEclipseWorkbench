@@ -1601,9 +1601,24 @@ class SummaryPage(QWizardPage):
                     lines.append("# REMEMBER TO REPLACE SOLAR FILTER after C3!")
                     lines.append("#")
                     
-                    c3_c4_duration = (c4_time - c3_time).total_seconds() - 2 * buffer_seconds
-                    c3_start_time = c3_time + timedelta(seconds=buffer_seconds)
+                    # Don't start the partial sequence too close behind the post-C3
+                    # contact bursts (C3 diamond ring at +1s, Baily's beads at +8s).
+                    # take_burst releases the camera shortly after firing, but a single
+                    # shot scheduled right behind it collides with the burst's USB
+                    # teardown -- Partial C3-C4 #1 at the default +10s is only 2s after
+                    # the +8s beads burst and hit -110.  Leave the same gap after the
+                    # last burst that the C2 side already uses successfully (Prominences
+                    # fires 5s after the C2 diamond burst and never collides), so the
+                    # first partial starts at max(buffer, beads_offset + 5s) = ~C3+13s.
+                    POST_C3_BEADS_OFFSET_S = 8.0
+                    POST_BURST_GAP_S = 5.0
+                    partial_start_s = buffer_seconds
+                    if wizard.field('diamond') or wizard.field('bailys'):
+                        partial_start_s = max(buffer_seconds,
+                                              POST_C3_BEADS_OFFSET_S + POST_BURST_GAP_S)
+                    c3_start_time = c3_time + timedelta(seconds=partial_start_s)
                     c4_end_time = c4_time - timedelta(seconds=buffer_seconds)
+                    c3_c4_duration = (c4_end_time - c3_start_time).total_seconds()
                     
                     if wizard.field('partial_magnitude'):
                         magnitude_interval = wizard.field('magnitude_value')

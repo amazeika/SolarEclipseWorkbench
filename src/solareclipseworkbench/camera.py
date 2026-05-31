@@ -724,41 +724,6 @@ def _wait_for_capture_complete(target, context, timeout_ms: int = 3000, max_even
     _drain_camera_events(target, context, timeout_ms=200, max_events=10)
 
 
-def _wait_for_burst_complete(target, context, idle_timeout_ms: int = 600, max_waits: int = 60) -> None:
-    """Block until the camera's USB interface is idle after a burst.
-
-    Unlike a single shot, a burst writes many frames that the body flushes to
-    the card over several seconds.  ``_wait_for_capture_complete`` breaks on the
-    *first* GP_EVENT_FILE_ADDED, which is correct for one frame but releases the
-    USB lock while the remaining burst frames are still transferring -- the next
-    scheduled shot then starts mid-transfer and fails with -110 (I/O in
-    progress).  Instead, keep consuming events until a full ``idle_timeout_ms``
-    window passes with no event, i.e. the body has finished flushing and the
-    interface is quiet.
-
-    Each ``gp_camera_wait_for_event`` returns as soon as an event arrives, so
-    during active write-back the loop spins quickly; it only blocks for the full
-    ``idle_timeout_ms`` once the body goes quiet, then returns.  ``max_waits``
-    bounds the total wait so a chatty body cannot stall the scheduler
-    (default ~36 s ceiling; real bursts settle in a few seconds).
-
-    Args:
-        target:          gphoto2 Camera object.
-        context:         gphoto2 context.
-        idle_timeout_ms: A wait this long with no event means the burst is done.
-        max_waits:       Safety cap on iterations.
-    """
-    for _ in range(max_waits):
-        try:
-            event_type, _ = gp.check_result(
-                gp.gp_camera_wait_for_event(target, idle_timeout_ms, context)
-            )
-        except gphoto2.GPhoto2Error:
-            break
-        if event_type == gp.GP_EVENT_TIMEOUT:
-            break
-
-
 def _sony_drain_events(target, context) -> None:
     """Drain queued FILE_ADDED and property-change events from a Sony camera.
 
@@ -1295,14 +1260,13 @@ def take_burst(camera: Camera, camera_settings: CameraSettings, duration: float)
             # set config
             _set_gp_config(camera, config, context)
 
-            # Wait until the body has flushed ALL burst frames and the USB
-            # interface is idle before releasing the lock.  Breaking on the first
-            # frame (as _wait_for_capture_complete does) released the lock while
-            # later frames were still transferring, so the next scheduled shot
-            # started mid-transfer and failed with -110 (I/O in progress) -- seen
-            # on a 70D when C3-C4 #1 fires ~2 s after the Post-C3 beads burst.
-            target = camera._camera if hasattr(camera, '_camera') else camera
-            _wait_for_burst_complete(target, context)
+            # Release the USB lock immediately; the body flushes the burst frames
+            # to card in the background.  Holding the lock until the flush finished
+            # (~7 s for 15 RAW frames on a 70D) was an overcorrection that dropped
+            # the next contact burst (diamond ring / Baily's beads, only ~6-7 s
+            # apart).  Early release keeps those firing; the one shot that was too
+            # close (Partial C3-C4 #1, ~2 s after the Post-C3 beads burst) is spaced
+            # clear of the burst by the wizard instead (see #18).
         finally:
             # Restore Single drive so a subsequent take_picture is deterministic,
             # even if the burst raised partway through.
