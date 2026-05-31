@@ -441,14 +441,28 @@ def _raise_camera_init_error(camera_name: str, error: Exception) -> None:
     ) from error
 
 
-def _drain_camera_events(target, context, timeout_ms: int = 200, max_events: int = 50) -> None:
+def _event_name(event_type) -> str:
+    """Human-readable name for a gphoto2 GP_EVENT_* constant (for logging)."""
+    for attr in ("GP_EVENT_TIMEOUT", "GP_EVENT_FILE_ADDED", "GP_EVENT_FOLDER_ADDED",
+                 "GP_EVENT_CAPTURE_COMPLETE", "GP_EVENT_FILE_CHANGED", "GP_EVENT_UNKNOWN"):
+        if hasattr(gp, attr) and getattr(gp, attr) == event_type:
+            return attr.replace("GP_EVENT_", "")
+    return f"event#{event_type}"
+
+
+def _drain_camera_events(target, context, timeout_ms: int = 200, max_events: int = 50) -> int:
     """Drain pending camera events after a trigger_capture sequence.
 
     Canon cameras push CaptureComplete and ObjectAdded events onto the USB queue for
     every triggered shot. Leaving them unconsumed can stall subsequent gphoto2
     operations. This function consumes events until a GP_EVENT_TIMEOUT is received
     or max_events is exhausted.
+
+    Returns the number of (non-timeout) events consumed, so callers can log how
+    much was queued -- a count well above one shot's worth points to a backlog
+    left by earlier shots.
     """
+    drained = 0
     for _ in range(max_events):
         try:
             event_type, _ = gp.check_result(gp.gp_camera_wait_for_event(target, timeout_ms, context))
@@ -456,6 +470,10 @@ def _drain_camera_events(target, context, timeout_ms: int = 200, max_events: int
                 break
         except gphoto2.GPhoto2Error:
             break
+        drained += 1
+    if drained:
+        logging.debug("drain_camera_events: consumed %d queued event(s)", drained)
+    return drained
 
 
 def _find_memory_card_choice(capture_target_widget) -> str:
@@ -709,6 +727,7 @@ def _wait_for_capture_complete(target, context, timeout_ms: int = 3000, max_even
                      this only bounds the idle fallback.
         max_events:  Safety cap on iterations to avoid an infinite loop.
     """
+    broke_on = "max_events"
     for _ in range(max_events):
         try:
             event_type, _ = gp.check_result(
@@ -717,11 +736,18 @@ def _wait_for_capture_complete(target, context, timeout_ms: int = 3000, max_even
             if event_type in (gp.GP_EVENT_CAPTURE_COMPLETE,
                               gp.GP_EVENT_FILE_ADDED,
                               gp.GP_EVENT_TIMEOUT):
+                broke_on = _event_name(event_type)
                 break
         except gphoto2.GPhoto2Error:
+            broke_on = "error"
             break
     # Flush any ObjectAdded / leftover events with a short timeout.
-    _drain_camera_events(target, context, timeout_ms=200, max_events=10)
+    trailing = _drain_camera_events(target, context, timeout_ms=200, max_events=10)
+    # A break on a stale event, or many trailing events, means the previous
+    # shot left a backlog that this settle is paying off -- worth seeing when
+    # diagnosing why a later burst's drain runs long.
+    logging.debug("capture settle: broke on %s, drained %d trailing event(s)",
+                  broke_on, trailing)
 
 
 def _wait_for_burst_complete(target, context, idle_timeout_ms: int = 600, max_waits: int = 60) -> None:
@@ -748,15 +774,27 @@ def _wait_for_burst_complete(target, context, idle_timeout_ms: int = 600, max_wa
         idle_timeout_ms: A wait this long with no event means the burst is done.
         max_waits:       Safety cap on iterations.
     """
+    start = time.monotonic()
+    drained = 0
+    reason = "max_waits"
     for _ in range(max_waits):
         try:
             event_type, _ = gp.check_result(
                 gp.gp_camera_wait_for_event(target, idle_timeout_ms, context)
             )
         except gphoto2.GPhoto2Error:
+            reason = "error"
             break
         if event_type == gp.GP_EVENT_TIMEOUT:
+            reason = "idle"
             break
+        drained += 1
+    # The discriminator for "why is this burst slow": a count near one burst's
+    # frame total (~14 for a 2 s Canon burst) over a long elapsed time means slow
+    # card flush; a count far above that means a backlog of stale events left by
+    # earlier shots that this settle is draining. Logged at INFO (bursts are few).
+    logging.info("burst settle: drained %d event(s) over %.0f ms (stop: %s)",
+                 drained, (time.monotonic() - start) * 1000, reason)
 
 
 def _sony_drain_events(target, context) -> None:

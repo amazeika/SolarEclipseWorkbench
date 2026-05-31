@@ -54,6 +54,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Canon drive mode now defaults to Single at camera initialisation** instead of an
   immediately-overridden "Continuous high speed". Per-command code owns the drive mode
   (`take_burst` opts into continuous for the burst, then restores Single).
+- **Burst/capture settles now log how many camera events they drain**: each burst logs
+  (INFO) the event count, elapsed time and stop reason; each single-shot settle logs
+  (DEBUG) the event it broke on and its trailing drain count. This makes it visible
+  whether a slow burst is flushing its own frames or draining a backlog left by earlier
+  shots.
 
 ## [1.9.2] - 2026-04-25
 
