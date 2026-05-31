@@ -30,10 +30,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   could acquire the lock mid-transfer and fail with `GPhoto2Error: [-110] I/O in progress`
   (e.g. the C3-C4 #1 frame ~2 s after the Post-C3 beads burst). The burst now waits for
   capture-complete and drains queued events before releasing the lock.
-- **Corona shots no longer dropped next to the late earthshine**: the wizard's corona/
-  earthshine de-confliction left only a ~2 s gap around the C3-anchored late earthshine
-  exposure, with no margin for drift. A guard band now widens both earthshine exclusion
-  windows so corona shots keep a generous gap around the long earthshine exposures.
 - **Missed-shot indicator now counts failed shots**: the status-bar counter and red row
   highlight previously reacted only to *dropped* shots; a shot that was attempted but
   errored (`FAILED`, e.g. `-110 I/O in progress`) was invisible. Both outcomes now count.
