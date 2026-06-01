@@ -48,6 +48,17 @@ PAGE_PHENOMENA = 3
 PAGE_SUMMARY = 4
 
 
+# Minimum time a contact burst needs to clear the camera before the next shot.
+# A take_burst fires ~2 s and releases the USB lock, but the body keeps flushing
+# frames in the background; a single shot scheduled too soon behind it collides
+# with that teardown and fails with -110 (I/O in progress).  5 s is the gap the
+# C2 side has always used successfully (C2 diamond burst at C2-2 s, Prominences
+# at C2+3 s).  This is the single source of truth: the C3-C4 partial sequence
+# derives its start from it, and the C2 layout is checked against it at
+# generation time (Prominences is astronomically fixed and must not be moved).
+MIN_POST_BURST_GAP_S = 5.0
+
+
 # ConfigManager, GeocodingWorker, and LocationWidget are imported from location_ui.
 
 
@@ -1606,16 +1617,15 @@ class SummaryPage(QWizardPage):
                     # take_burst releases the camera shortly after firing, but a single
                     # shot scheduled right behind it collides with the burst's USB
                     # teardown -- Partial C3-C4 #1 at the default +10s is only 2s after
-                    # the +8s beads burst and hit -110.  Leave the same gap after the
-                    # last burst that the C2 side already uses successfully (Prominences
-                    # fires 5s after the C2 diamond burst and never collides), so the
-                    # first partial starts at max(buffer, beads_offset + 5s) = ~C3+13s.
+                    # the +8s beads burst and hit -110.  Start the partial sequence
+                    # MIN_POST_BURST_GAP_S after the last burst (beads at +8s), i.e.
+                    # ~C3+13s.  Unlike the totality shots, the partial cadence is
+                    # flexible, so shifting its start is safe.
                     POST_C3_BEADS_OFFSET_S = 8.0
-                    POST_BURST_GAP_S = 5.0
                     partial_start_s = buffer_seconds
                     if wizard.field('diamond') or wizard.field('bailys'):
                         partial_start_s = max(buffer_seconds,
-                                              POST_C3_BEADS_OFFSET_S + POST_BURST_GAP_S)
+                                              POST_C3_BEADS_OFFSET_S + MIN_POST_BURST_GAP_S)
                     c3_start_time = c3_time + timedelta(seconds=partial_start_s)
                     c4_end_time = c4_time - timedelta(seconds=buffer_seconds)
                     c3_c4_duration = (c4_end_time - c3_start_time).total_seconds()
@@ -1817,6 +1827,20 @@ class SummaryPage(QWizardPage):
                 # Start beads burst 1s earlier, diamond ring 1s later to avoid overlap (each burst ~2s + 3s gap)
                 lines.append(f'take_burst, C2, -, 0:00:08.0, {camera_name}, {beads_shutter}, {aperture}, {preferred_iso}, {beads_burst_param}, "Pre-C2 beads"')
                 lines.append(f'take_burst, C2, -, 0:00:02.0, {camera_name}, {diamond_shutter}, {aperture}, {preferred_iso}, {diamond_burst_param}, "C2 diamond ring"')
+                # Guard: the C2 diamond burst (fires 2s before C2) must clear the
+                # camera before the first totality shot.  Prominences / Corona inner
+                # are astronomically fixed at C2+3s and must NOT be moved, so we only
+                # *check* the gap here (single source of truth: MIN_POST_BURST_GAP_S)
+                # and flag it in the script rather than silently shipping a -110.
+                C2_DIAMOND_BURST_OFFSET_S = -2.0   # fires at C2-2s (must match the line above)
+                FIRST_TOTALITY_SHOT_OFFSET_S = 3.0  # Prominences / Corona inner at C2+3s (fixed)
+                c2_post_burst_gap = FIRST_TOTALITY_SHOT_OFFSET_S - C2_DIAMOND_BURST_OFFSET_S
+                if c2_post_burst_gap < MIN_POST_BURST_GAP_S:
+                    lines.append(
+                        f'# WARNING: only {c2_post_burst_gap:.0f}s between the C2 diamond '
+                        f'burst and the first totality shot (need >= {MIN_POST_BURST_GAP_S:.0f}s); '
+                        f'the first totality shot may be dropped (-110). The totality shots are '
+                        f'fixed, so move the C2 diamond burst earlier instead.')
                 lines.append("")
             
             # Totality/Annularity - Corona

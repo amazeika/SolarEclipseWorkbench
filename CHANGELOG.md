@@ -33,7 +33,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   partial fires. `take_burst` keeps releasing the USB lock immediately, letting the body
   flush the burst frames in the background — an earlier attempt to hold the lock through the
   multi-second RAW flush (~7 s for 15 frames on a 70D) was reverted because it dropped the
-  *adjacent* contact burst (the diamond ring / Baily's beads, only ~6-7 s apart).
+  *adjacent* contact burst (the diamond ring / Baily's beads, only ~6-7 s apart). The
+  required gap is now a single named constant (`MIN_POST_BURST_GAP_S`): the C3-C4 partial
+  start derives from it, and the C2 layout (where the totality shots are astronomically
+  fixed and must not move) is *checked* against it at generation time — emitting a warning in
+  the script if the C2 diamond burst would sit too close to the first totality shot, instead
+  of relying on hardcoded offsets that happened to line up.
 - **Missed-shot indicator now counts failed shots**: the status-bar counter and red row
   highlight previously reacted only to *dropped* shots; a shot that was attempted but
   errored (`FAILED`, e.g. `-110 I/O in progress`) was invisible. Both outcomes now count.

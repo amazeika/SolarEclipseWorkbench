@@ -73,3 +73,30 @@ def test_first_partial_cleared_past_the_beads_burst(_qapp):
 def test_first_partial_unchanged_without_bursts(_qapp):
     # No post-C3 bursts -> nothing to clear -> original C3+10 s start.
     assert _first_c3c4_offset(_generate(diamond=False, bailys=False)) == 10.0
+
+
+def test_c2_gap_meets_minimum_so_no_warning(_qapp):
+    # C2 diamond burst at C2-2 s, Prominences at C2+3 s = 5 s = the minimum, so
+    # the generation-time guard must NOT emit a warning.
+    script = _generate(diamond=True, bailys=True)
+    assert "WARNING: only" not in script
+
+
+def test_c2_guard_uses_the_shared_constant():
+    # The C2 gap and the C3 partial offset must derive from the same source of
+    # truth, so the C2 layout's safety can't silently drift from the C3 fix.
+    from solareclipseworkbench import wizard
+
+    assert wizard.MIN_POST_BURST_GAP_S == 5.0
+    # C2 diamond burst fires 2 s before C2; first totality shot is 3 s after C2.
+    assert (3.0 - (-2.0)) >= wizard.MIN_POST_BURST_GAP_S
+
+
+def test_c2_guard_would_fire_below_minimum(monkeypatch):
+    # Raise the required gap above the fixed 5 s C2 layout and confirm the guard
+    # emits the warning (proving it's a live check, not dead code).
+    from solareclipseworkbench import wizard
+
+    monkeypatch.setattr(wizard, "MIN_POST_BURST_GAP_S", 7.0)
+    script = _generate(diamond=True, bailys=True)
+    assert "WARNING: only 5s" in script
