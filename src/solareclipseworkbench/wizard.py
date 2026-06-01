@@ -48,6 +48,33 @@ PAGE_PHENOMENA = 3
 PAGE_SUMMARY = 4
 
 
+# Minimum time a contact burst needs to clear the camera before the next shot.
+# A take_burst fires ~2 s and releases the USB lock, but the body keeps flushing
+# frames in the background; a single shot scheduled too soon behind it collides
+# with that teardown and fails with -110 (I/O in progress).  5 s is the gap the
+# C2 side has always used successfully (C2 diamond burst at C2-2 s, Prominences
+# at C2+3 s).  This is the single source of truth: the C3-C4 partial sequence
+# derives its start from it, and the C2 layout is checked against it at
+# generation time (Prominences is astronomically fixed and must not be moved).
+MIN_POST_BURST_GAP_S = 5.0
+
+
+def _burst_gap_warning(gap_s: float, earlier: str, later: str) -> str | None:
+    """Return a script WARNING line if two adjacent shots are too close, else None.
+
+    Used where both shots are astronomically fixed (contact bursts at C2/C3) and
+    therefore cannot be moved apart: we can only *verify* that the gap the eclipse
+    geometry gives us clears MIN_POST_BURST_GAP_S, and flag it in the script if a
+    future change (or a very short totality) ever makes it too tight.
+    """
+    if gap_s >= MIN_POST_BURST_GAP_S:
+        return None
+    return (f'# WARNING: only {gap_s:.0f}s between "{earlier}" and "{later}" '
+            f'(a burst needs >= {MIN_POST_BURST_GAP_S:.0f}s to clear the camera); '
+            f'"{later}" may be dropped (-110). Both are fixed contact moments, so '
+            f'this is a constraint of the eclipse geometry, not something to retune.')
+
+
 # ConfigManager, GeocodingWorker, and LocationWidget are imported from location_ui.
 
 
@@ -1601,9 +1628,23 @@ class SummaryPage(QWizardPage):
                     lines.append("# REMEMBER TO REPLACE SOLAR FILTER after C3!")
                     lines.append("#")
                     
-                    c3_c4_duration = (c4_time - c3_time).total_seconds() - 2 * buffer_seconds
-                    c3_start_time = c3_time + timedelta(seconds=buffer_seconds)
+                    # Don't start the partial sequence too close behind the post-C3
+                    # contact bursts (C3 diamond ring at +1s, Baily's beads at +8s).
+                    # take_burst releases the camera shortly after firing, but a single
+                    # shot scheduled right behind it collides with the burst's USB
+                    # teardown -- Partial C3-C4 #1 at the default +10s is only 2s after
+                    # the +8s beads burst and hit -110.  Start the partial sequence
+                    # MIN_POST_BURST_GAP_S after the last burst (beads at +8s), i.e.
+                    # ~C3+13s.  Unlike the totality shots, the partial cadence is
+                    # flexible, so shifting its start is safe.
+                    POST_C3_BEADS_OFFSET_S = 8.0
+                    partial_start_s = buffer_seconds
+                    if wizard.field('diamond') or wizard.field('bailys'):
+                        partial_start_s = max(buffer_seconds,
+                                              POST_C3_BEADS_OFFSET_S + MIN_POST_BURST_GAP_S)
+                    c3_start_time = c3_time + timedelta(seconds=partial_start_s)
                     c4_end_time = c4_time - timedelta(seconds=buffer_seconds)
+                    c3_c4_duration = (c4_end_time - c3_start_time).total_seconds()
                     
                     if wizard.field('partial_magnitude'):
                         magnitude_interval = wizard.field('magnitude_value')
@@ -1799,9 +1840,26 @@ class SummaryPage(QWizardPage):
                 beads_burst_param = 30 if is_nikon_or_sony else 2  # Nikon/Sony: 30 pictures, Canon: 2 seconds
                 diamond_burst_param = 30 if is_nikon_or_sony else 2
                 
-                # Start beads burst 1s earlier, diamond ring 1s later to avoid overlap (each burst ~2s + 3s gap)
+                # Pre-C2 beads then the C2 diamond ring, both just before C2. These
+                # are fixed contact moments ~6s apart (beads at C2-8s, diamond at
+                # C2-2s); the gap is set by the eclipse, not retunable, so we verify
+                # it clears MIN_POST_BURST_GAP_S rather than space it ourselves.
+                PRE_C2_BEADS_OFFSET_S = -8.0
+                C2_DIAMOND_OFFSET_S = -2.0
                 lines.append(f'take_burst, C2, -, 0:00:08.0, {camera_name}, {beads_shutter}, {aperture}, {preferred_iso}, {beads_burst_param}, "Pre-C2 beads"')
                 lines.append(f'take_burst, C2, -, 0:00:02.0, {camera_name}, {diamond_shutter}, {aperture}, {preferred_iso}, {diamond_burst_param}, "C2 diamond ring"')
+                _w = _burst_gap_warning(C2_DIAMOND_OFFSET_S - PRE_C2_BEADS_OFFSET_S,
+                                        "Pre-C2 beads", "C2 diamond ring")
+                if _w:
+                    lines.append(_w)
+                # Same check on the far side: the C2 diamond burst must clear the
+                # camera before the first totality shot (Prominences / Corona inner,
+                # astronomically fixed at C2+3s).
+                FIRST_TOTALITY_SHOT_OFFSET_S = 3.0
+                _w = _burst_gap_warning(FIRST_TOTALITY_SHOT_OFFSET_S - C2_DIAMOND_OFFSET_S,
+                                        "C2 diamond ring", "first totality shot (C2+3s)")
+                if _w:
+                    lines.append(_w)
                 lines.append("")
             
             # Totality/Annularity - Corona
@@ -2115,9 +2173,19 @@ class SummaryPage(QWizardPage):
                 diamond_burst_param = 30 if is_nikon_or_sony else 2  # Nikon/Sony: 30 pictures, Canon: 2 seconds
                 beads_burst_param = 30 if is_nikon_or_sony else 2
                 
-                # Start diamond ring 1s earlier, beads burst 1s later to avoid overlap (each burst ~2s + 3s gap)
+                # C3 diamond ring then Post-C3 beads, both just after C3. Fixed
+                # contact moments ~7s apart (diamond at C3+1s, beads at C3+8s);
+                # verify the gap clears MIN_POST_BURST_GAP_S (set by the eclipse,
+                # not retunable). The +8s beads offset is what the C3-C4 partial
+                # start is derived from above (POST_C3_BEADS_OFFSET_S).
+                C3_DIAMOND_OFFSET_S = 1.0
+                C3_BEADS_OFFSET_S = 8.0
                 lines.append(f'take_burst, C3, +, 0:00:01.0, {camera_name}, {diamond_c3_shutter}, {aperture}, {preferred_iso}, {diamond_burst_param}, "C3 diamond ring"')
                 lines.append(f'take_burst, C3, +, 0:00:08.0, {camera_name}, {beads_c3_shutter}, {aperture}, {preferred_iso}, {beads_burst_param}, "Post-C3 beads"')
+                _w = _burst_gap_warning(C3_BEADS_OFFSET_S - C3_DIAMOND_OFFSET_S,
+                                        "C3 diamond ring", "Post-C3 beads")
+                if _w:
+                    lines.append(_w)
                 lines.append("# REPLACE SOLAR FILTER after C3!")
                 lines.append("")
         
