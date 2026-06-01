@@ -59,6 +59,22 @@ PAGE_SUMMARY = 4
 MIN_POST_BURST_GAP_S = 5.0
 
 
+def _burst_gap_warning(gap_s: float, earlier: str, later: str) -> str | None:
+    """Return a script WARNING line if two adjacent shots are too close, else None.
+
+    Used where both shots are astronomically fixed (contact bursts at C2/C3) and
+    therefore cannot be moved apart: we can only *verify* that the gap the eclipse
+    geometry gives us clears MIN_POST_BURST_GAP_S, and flag it in the script if a
+    future change (or a very short totality) ever makes it too tight.
+    """
+    if gap_s >= MIN_POST_BURST_GAP_S:
+        return None
+    return (f'# WARNING: only {gap_s:.0f}s between "{earlier}" and "{later}" '
+            f'(a burst needs >= {MIN_POST_BURST_GAP_S:.0f}s to clear the camera); '
+            f'"{later}" may be dropped (-110). Both are fixed contact moments, so '
+            f'this is a constraint of the eclipse geometry, not something to retune.')
+
+
 # ConfigManager, GeocodingWorker, and LocationWidget are imported from location_ui.
 
 
@@ -1824,23 +1840,26 @@ class SummaryPage(QWizardPage):
                 beads_burst_param = 30 if is_nikon_or_sony else 2  # Nikon/Sony: 30 pictures, Canon: 2 seconds
                 diamond_burst_param = 30 if is_nikon_or_sony else 2
                 
-                # Start beads burst 1s earlier, diamond ring 1s later to avoid overlap (each burst ~2s + 3s gap)
+                # Pre-C2 beads then the C2 diamond ring, both just before C2. These
+                # are fixed contact moments ~6s apart (beads at C2-8s, diamond at
+                # C2-2s); the gap is set by the eclipse, not retunable, so we verify
+                # it clears MIN_POST_BURST_GAP_S rather than space it ourselves.
+                PRE_C2_BEADS_OFFSET_S = -8.0
+                C2_DIAMOND_OFFSET_S = -2.0
                 lines.append(f'take_burst, C2, -, 0:00:08.0, {camera_name}, {beads_shutter}, {aperture}, {preferred_iso}, {beads_burst_param}, "Pre-C2 beads"')
                 lines.append(f'take_burst, C2, -, 0:00:02.0, {camera_name}, {diamond_shutter}, {aperture}, {preferred_iso}, {diamond_burst_param}, "C2 diamond ring"')
-                # Guard: the C2 diamond burst (fires 2s before C2) must clear the
-                # camera before the first totality shot.  Prominences / Corona inner
-                # are astronomically fixed at C2+3s and must NOT be moved, so we only
-                # *check* the gap here (single source of truth: MIN_POST_BURST_GAP_S)
-                # and flag it in the script rather than silently shipping a -110.
-                C2_DIAMOND_BURST_OFFSET_S = -2.0   # fires at C2-2s (must match the line above)
-                FIRST_TOTALITY_SHOT_OFFSET_S = 3.0  # Prominences / Corona inner at C2+3s (fixed)
-                c2_post_burst_gap = FIRST_TOTALITY_SHOT_OFFSET_S - C2_DIAMOND_BURST_OFFSET_S
-                if c2_post_burst_gap < MIN_POST_BURST_GAP_S:
-                    lines.append(
-                        f'# WARNING: only {c2_post_burst_gap:.0f}s between the C2 diamond '
-                        f'burst and the first totality shot (need >= {MIN_POST_BURST_GAP_S:.0f}s); '
-                        f'the first totality shot may be dropped (-110). The totality shots are '
-                        f'fixed, so move the C2 diamond burst earlier instead.')
+                _w = _burst_gap_warning(C2_DIAMOND_OFFSET_S - PRE_C2_BEADS_OFFSET_S,
+                                        "Pre-C2 beads", "C2 diamond ring")
+                if _w:
+                    lines.append(_w)
+                # Same check on the far side: the C2 diamond burst must clear the
+                # camera before the first totality shot (Prominences / Corona inner,
+                # astronomically fixed at C2+3s).
+                FIRST_TOTALITY_SHOT_OFFSET_S = 3.0
+                _w = _burst_gap_warning(FIRST_TOTALITY_SHOT_OFFSET_S - C2_DIAMOND_OFFSET_S,
+                                        "C2 diamond ring", "first totality shot (C2+3s)")
+                if _w:
+                    lines.append(_w)
                 lines.append("")
             
             # Totality/Annularity - Corona
@@ -2154,9 +2173,19 @@ class SummaryPage(QWizardPage):
                 diamond_burst_param = 30 if is_nikon_or_sony else 2  # Nikon/Sony: 30 pictures, Canon: 2 seconds
                 beads_burst_param = 30 if is_nikon_or_sony else 2
                 
-                # Start diamond ring 1s earlier, beads burst 1s later to avoid overlap (each burst ~2s + 3s gap)
+                # C3 diamond ring then Post-C3 beads, both just after C3. Fixed
+                # contact moments ~7s apart (diamond at C3+1s, beads at C3+8s);
+                # verify the gap clears MIN_POST_BURST_GAP_S (set by the eclipse,
+                # not retunable). The +8s beads offset is what the C3-C4 partial
+                # start is derived from above (POST_C3_BEADS_OFFSET_S).
+                C3_DIAMOND_OFFSET_S = 1.0
+                C3_BEADS_OFFSET_S = 8.0
                 lines.append(f'take_burst, C3, +, 0:00:01.0, {camera_name}, {diamond_c3_shutter}, {aperture}, {preferred_iso}, {diamond_burst_param}, "C3 diamond ring"')
                 lines.append(f'take_burst, C3, +, 0:00:08.0, {camera_name}, {beads_c3_shutter}, {aperture}, {preferred_iso}, {beads_burst_param}, "Post-C3 beads"')
+                _w = _burst_gap_warning(C3_BEADS_OFFSET_S - C3_DIAMOND_OFFSET_S,
+                                        "C3 diamond ring", "Post-C3 beads")
+                if _w:
+                    lines.append(_w)
                 lines.append("# REPLACE SOLAR FILTER after C3!")
                 lines.append("")
         

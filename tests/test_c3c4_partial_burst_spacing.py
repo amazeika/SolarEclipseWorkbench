@@ -75,28 +75,37 @@ def test_first_partial_unchanged_without_bursts(_qapp):
     assert _first_c3c4_offset(_generate(diamond=False, bailys=False)) == 10.0
 
 
-def test_c2_gap_meets_minimum_so_no_warning(_qapp):
-    # C2 diamond burst at C2-2 s, Prominences at C2+3 s = 5 s = the minimum, so
-    # the generation-time guard must NOT emit a warning.
+def test_all_burst_gaps_meet_minimum_so_no_warning(_qapp):
+    # Every burst-adjacency in the default 70D script clears MIN_POST_BURST_GAP_S
+    # (C2 pair 6s, C2 diamond->totality 5s, C3 pair 7s, C3 beads->partial 5s), so
+    # the generation-time guards must emit no warnings.
     script = _generate(diamond=True, bailys=True)
-    assert "WARNING: only" not in script
+    assert "# WARNING:" not in script
 
 
-def test_c2_guard_uses_the_shared_constant():
-    # The C2 gap and the C3 partial offset must derive from the same source of
-    # truth, so the C2 layout's safety can't silently drift from the C3 fix.
+def test_burst_guards_use_the_shared_constant():
+    # All four burst-adjacency checks must reference the one source of truth, so
+    # the script's safety can't silently drift from the constant.
     from solareclipseworkbench import wizard
 
     assert wizard.MIN_POST_BURST_GAP_S == 5.0
-    # C2 diamond burst fires 2 s before C2; first totality shot is 3 s after C2.
-    assert (3.0 - (-2.0)) >= wizard.MIN_POST_BURST_GAP_S
+    # The helper is the single chokepoint for the rule.
+    assert wizard._burst_gap_warning(5.0, "a", "b") is None       # at minimum: ok
+    assert wizard._burst_gap_warning(4.0, "a", "b") is not None   # below: warns
+    assert '"a"' in wizard._burst_gap_warning(4.0, "a", "b")
+    assert '"b"' in wizard._burst_gap_warning(4.0, "a", "b")
 
 
-def test_c2_guard_would_fire_below_minimum(monkeypatch):
-    # Raise the required gap above the fixed 5 s C2 layout and confirm the guard
-    # emits the warning (proving it's a live check, not dead code).
+def test_guards_fire_when_minimum_raised_above_layout(monkeypatch, _qapp):
+    # Raise the required gap above every fixed gap in the script (max is the 7s
+    # C3 pair) and confirm warnings appear for all four adjacencies -- proving the
+    # guards are live checks, not dead code.
     from solareclipseworkbench import wizard
 
-    monkeypatch.setattr(wizard, "MIN_POST_BURST_GAP_S", 7.0)
+    monkeypatch.setattr(wizard, "MIN_POST_BURST_GAP_S", 8.0)
     script = _generate(diamond=True, bailys=True)
-    assert "WARNING: only 5s" in script
+    warnings = [l for l in script.splitlines() if l.startswith("# WARNING:")]
+    # C2 pair (6s), C2 diamond->totality (5s), C3 pair (7s) all < 8s.
+    assert len(warnings) >= 3
+    assert any("Pre-C2 beads" in w for w in warnings)
+    assert any("C3 diamond ring" in w and "Post-C3 beads" in w for w in warnings)
