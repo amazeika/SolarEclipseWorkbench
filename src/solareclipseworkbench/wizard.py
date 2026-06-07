@@ -48,14 +48,23 @@ PAGE_PHENOMENA = 3
 PAGE_SUMMARY = 4
 
 
+# Duration (Canon) of every contact burst, in seconds.  A burst occupies the
+# camera body for its exposure plus a card-flush tail; the next shot can only
+# fire once that flush clears, or it -110s (I/O in progress).  On an 80D a 2 s
+# burst left too little room and the shot right after it (C2 Prominences, C3-C4
+# partial #1) missed; a 1 s burst (~7 frames at ~7 fps -- plenty for the diamond
+# ring / Baily's beads, which last only ~1-2 s) halves the flush and clears the
+# following shot.  Nikon/Sony bursts are frame counts and are unaffected.
+CANON_BURST_DURATION_S = 1
+
 # Minimum time a contact burst needs to clear the camera before the next shot.
-# A take_burst fires ~2 s and releases the USB lock, but the body keeps flushing
-# frames in the background; a single shot scheduled too soon behind it collides
-# with that teardown and fails with -110 (I/O in progress).  5 s is the gap the
-# C2 side has always used successfully (C2 diamond burst at C2-2 s, Prominences
-# at C2+3 s).  This is the single source of truth: the C3-C4 partial sequence
-# derives its start from it, and the C2 layout is checked against it at
-# generation time (Prominences is astronomically fixed and must not be moved).
+# A take_burst fires, then the body keeps flushing frames in the background; a
+# single shot scheduled too soon behind it collides with that teardown and fails
+# with -110 (I/O in progress).  5 s is the gap the C2 side has always used
+# successfully (C2 diamond burst at C2-2 s, Prominences at C2+3 s).  This is the
+# single source of truth: the C3-C4 partial sequence derives its start from it,
+# and the C2 layout is checked against it at generation time (Prominences is
+# astronomically fixed and must not be moved).
 MIN_POST_BURST_GAP_S = 5.0
 
 
@@ -1837,8 +1846,8 @@ class SummaryPage(QWizardPage):
                 # Determine burst parameter based on camera brand:
                 # Sony and Nikon use number of frames; Canon uses duration in seconds.
                 is_nikon_or_sony = 'nikon' in camera_name.lower() or 'sony' in camera_name.lower()
-                beads_burst_param = 30 if is_nikon_or_sony else 2  # Nikon/Sony: 30 pictures, Canon: 2 seconds
-                diamond_burst_param = 30 if is_nikon_or_sony else 2
+                beads_burst_param = 30 if is_nikon_or_sony else CANON_BURST_DURATION_S  # Nikon/Sony: 30 pictures, Canon: seconds
+                diamond_burst_param = 30 if is_nikon_or_sony else CANON_BURST_DURATION_S
                 
                 # Pre-C2 beads then the C2 diamond ring, both just before C2. These
                 # are fixed contact moments ~6s apart (beads at C2-8s, diamond at
@@ -2170,8 +2179,8 @@ class SummaryPage(QWizardPage):
                 # Determine burst parameter based on camera brand:
                 # Sony and Nikon use number of frames; Canon uses duration in seconds.
                 is_nikon_or_sony = 'nikon' in camera_name.lower() or 'sony' in camera_name.lower()
-                diamond_burst_param = 30 if is_nikon_or_sony else 2  # Nikon/Sony: 30 pictures, Canon: 2 seconds
-                beads_burst_param = 30 if is_nikon_or_sony else 2
+                diamond_burst_param = 30 if is_nikon_or_sony else CANON_BURST_DURATION_S  # Nikon/Sony: 30 pictures, Canon: seconds
+                beads_burst_param = 30 if is_nikon_or_sony else CANON_BURST_DURATION_S
                 
                 # C3 diamond ring then Post-C3 beads, both just after C3. Fixed
                 # contact moments ~7s apart (diamond at C3+1s, beads at C3+8s);
