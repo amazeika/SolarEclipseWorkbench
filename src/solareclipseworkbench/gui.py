@@ -6,11 +6,13 @@
 """
 import argparse
 import datetime
+import getpass
 import logging
 import math
 import os.path
 import queue
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from importlib.metadata import version, PackageNotFoundError
@@ -70,8 +72,12 @@ BEFORE_AFTER = {
 
 REFERENCE_MOMENTS = ["C1", "C2", "MAX", "C3", "C4", "sunset", "sunrise"]
 
+# Scope the log file per-user so a stale file owned by another user (e.g. left
+# behind by a previous `sudo` run) can never block startup with a PermissionError.
+LOG_FILE = os.path.join(tempfile.gettempdir(), f"solareclipseworkbench-{getpass.getuser()}.log")
+
 LOGGER = logging.getLogger("Solar Eclipse Workbench UI")
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)-8s %(message)s', datefmt='%a, %d %b %Y %H:%M:%S', filename="/tmp/solareclipseworkbench.log", filemode='w')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)-8s %(message)s', datefmt='%a, %d %b %Y %H:%M:%S', filename=LOG_FILE, filemode='w')
 
 
 class SolarEclipseModel:
@@ -2917,7 +2923,7 @@ def main():
     logging.basicConfig(filename=f'{time_string}.log', level=logging.DEBUG, format='%(asctime)s %(message)s')
     # Write the shot report alongside the application log (see the /tmp log configured
     # at module import) as /tmp/<timestamp>.shots.csv.
-    log_dir = os.path.dirname("/tmp/solareclipseworkbench.log")
+    log_dir = os.path.dirname(LOG_FILE)
     shot_log.set_run_basename(os.path.join(log_dir, time_string))
     # Also log to stdout so users see debug output in terminal
     console_handler = logging.StreamHandler(sys.stdout)
