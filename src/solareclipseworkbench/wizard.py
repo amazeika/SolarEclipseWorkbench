@@ -742,6 +742,23 @@ class EquipmentPage(QWizardPage):
             QMessageBox.information(self, "No Camera Found", msg)
             return
 
+        # libgphoto2 sometimes reports one physical camera twice (a real port
+        # plus a phantom on a bogus bus such as usb:000,001).  Collapse entries
+        # that share a serial number so a single connected camera is not mistaken
+        # for several.  Best-effort: on any failure, keep the raw list.
+        if len(detected) > 1:
+            self.detect_camera_btn.setEnabled(False)
+            self.detect_camera_btn.setText("Detecting…")
+            QApplication.processEvents()
+            try:
+                from solareclipseworkbench.camera import dedupe_cameras_by_serial
+                detected = dedupe_cameras_by_serial(detected)
+            except Exception:
+                pass
+            finally:
+                self.detect_camera_btn.setEnabled(True)
+                self.detect_camera_btn.setText("Detect Connected Camera")
+
         if len(detected) > 1:
             # Ask the user to disconnect all but one camera
             model_list = "\n".join(f"  • {m} ({p})" for m, p in detected)
