@@ -1879,6 +1879,85 @@ def get_serial_number(camera: 'BaseCamera') -> Optional[str]:
     return None
 
 
+def _is_phantom_port(port: str) -> bool:
+    """True for libgphoto2's bogus-bus phantom ports.
+
+    A single USB camera is sometimes reported a second time on bus ``000``
+    (e.g. ``usb:000,001``), which is not a real USB bus.  When two entries turn
+    out to be the same physical camera, the real-bus port is preferred over such
+    a phantom.
+    """
+    return bool(port) and port.startswith('usb:000,')
+
+
+def dedupe_cameras_by_serial(
+    detected: list,
+    *,
+    open_fn=get_camera_by_port,
+    serial_fn=get_serial_number,
+) -> list:
+    """Collapse autodetect entries that point at the same physical camera.
+
+    libgphoto2 occasionally reports a single USB camera twice — a real port plus
+    a phantom on a bogus bus (e.g. ``usb:000,001``).  Both entries open fine and
+    return the SAME serial number, so the wizard would otherwise mistake one
+    camera for several connected bodies.  This helper opens each detected entry,
+    reads its serial, and keeps only one entry per distinct serial.
+
+    Safety: an entry whose serial cannot be read (or whose camera will not open)
+    is always kept — we never silently drop a possibly-distinct camera.  When two
+    entries share a serial, the real-bus port is preferred over a ``usb:000``
+    phantom (see :func:`_is_phantom_port`).
+
+    Args:
+        detected:  list of ``(model_name, port)`` tuples from :func:`get_cameras`.
+        open_fn:   opener ``open_fn(model_name, port) -> camera`` (injectable for tests).
+        serial_fn: serial reader ``serial_fn(camera) -> Optional[str]`` (injectable).
+
+    Returns: a deduplicated list of ``(model_name, port)`` tuples, in the order
+        the kept cameras were first seen.
+    """
+    kept: list = []         # ordered (model, port) results
+    by_serial: dict = {}    # serial -> index into kept
+
+    for model, port in detected:
+        serial = None
+        cam = None
+        try:
+            cam = open_fn(model, port)
+            serial = serial_fn(cam)
+        except Exception as exc:
+            logging.debug('dedup: could not read serial for %s @ %s: %s', model, port, exc)
+        finally:
+            if cam is not None:
+                try:
+                    cam.disconnect()
+                except Exception:
+                    pass
+
+        if not serial:
+            # Unknown serial: cannot prove it is a duplicate, so keep it.
+            kept.append((model, port))
+            continue
+
+        if serial in by_serial:
+            idx = by_serial[serial]
+            kept_model, kept_port = kept[idx]
+            logging.info(
+                'dedup: "%s @ %s" is the same physical camera as "%s @ %s" '
+                '(serial %s); collapsing to one entry.',
+                model, port, kept_model, kept_port, serial,
+            )
+            # Prefer a real-bus port over a usb:000 phantom for the kept entry.
+            if _is_phantom_port(kept_port) and not _is_phantom_port(port):
+                kept[idx] = (model, port)
+        else:
+            by_serial[serial] = len(kept)
+            kept.append((model, port))
+
+    return kept
+
+
 def get_free_space(camera: Camera) -> float:
     """ Return the free space on the card of the selected camera 
     
