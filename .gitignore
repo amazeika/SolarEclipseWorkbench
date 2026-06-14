@@ -2,6 +2,12 @@
 
 .idea
 
+# VSCode Local History extension
+.history
+
+# Claude
+.Claude
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
