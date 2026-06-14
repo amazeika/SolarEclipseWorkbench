@@ -170,3 +170,10 @@ cython_debug/
 #.idea/
 
 de421.bsp
+
+# >>> ckit (managed — do not edit) >>>
+.ckit
+.claude/skills/ckit-*
+.claude/agents/ckit-*.md
+.claude/settings.local.json
+# <<< ckit <<<
