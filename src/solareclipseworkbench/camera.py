@@ -75,6 +75,27 @@ _VIEWFINDER_WIDGET_NAMES = ('eosviewfinder', 'viewfinder')
 # Widgets the probe reports on so the magnification work has real values to build on.
 _LIVE_VIEW_PROBE_WIDGETS = _VIEWFINDER_WIDGET_NAMES + ('eoszoom', 'eoszoomposition')
 
+# Zoom levels the 80D accepts (hardware-probed, issue #26).  eoszoom is a free-text
+# widget that advertises no choices, and writing an out-of-set value has knocked the
+# body off USB entirely, so every write is validated against this set first.
+LIVE_VIEW_ZOOM_LEVELS = (1, 5, 10)
+
+
+def _set_live_view_zoom(target, context, level: int) -> None:
+    """Write eoszoom and drain the config events that follow.  Caller holds the USB lock.
+
+    The event drain is load-bearing: without it the 80D silently ignores the write.
+    Success never shows up in the widget (readback stays stale) — only as a change
+    in preview frame dimensions, which the caller tracks via _jpeg_dimensions.
+    """
+    if level not in LIVE_VIEW_ZOOM_LEVELS:
+        raise ValueError(f'live-view zoom level must be one of {LIVE_VIEW_ZOOM_LEVELS}, got {level!r}')
+    config = gp.check_result(gp.gp_camera_get_config(target, context))
+    widget = gp.check_result(gp.gp_widget_get_child_by_name(config, 'eoszoom'))
+    gp.gp_widget_set_value(widget, str(level))
+    gp.gp_camera_set_config(target, config, context)
+    _drain_camera_events(target, context, timeout_ms=500)
+
 
 def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
     """Return (width, height) of a JPEG, or None when the markers cannot be read.
@@ -958,10 +979,48 @@ class LiveViewThread(threading.Thread):
         self._stop_event = threading.Event()
         self._paused = threading.Event()
         self._probed = False
+        self._zoom_request: Optional[int] = None
+        self._zoom_level = 1
+        self._zoom_error: Optional[str] = None
+        self._base_dimensions: Optional[tuple] = None
+        self._last_dimensions: Optional[tuple] = None
 
     def stop(self):
         """Signal the thread to stop and wait briefly for it to exit."""
         self._stop_event.set()
+
+    def request_zoom(self, level: int) -> bool:
+        """Ask the worker to change live-view zoom; applied under the USB lock.
+
+        Returns False without requesting anything when *level* is outside
+        LIVE_VIEW_ZOOM_LEVELS.
+        """
+        if level not in LIVE_VIEW_ZOOM_LEVELS:
+            return False
+        self._zoom_error = None
+        self._zoom_request = level
+        return True
+
+    @property
+    def zoom_level(self) -> int:
+        """Last zoom level successfully written to the camera."""
+        return self._zoom_level
+
+    @property
+    def zoom_error(self) -> Optional[str]:
+        """Why the last zoom request failed, or None."""
+        return self._zoom_error
+
+    @property
+    def zoom_engaged(self) -> bool:
+        """True while the stream's frame size differs from the unzoomed baseline.
+
+        Frame dimensions are the only reliable zoom signal — the eoszoom widget
+        reads back a stale value even while zoomed.
+        """
+        return (self._base_dimensions is not None
+                and self._last_dimensions is not None
+                and self._last_dimensions != self._base_dimensions)
 
     def pause(self):
         """Suspend preview capture without stopping the thread."""
@@ -1012,6 +1071,17 @@ class LiveViewThread(threading.Thread):
                     logging.debug('LiveViewThread: USB lock busy, skipping frame')
                     continue
 
+                if self._zoom_request is not None:
+                    request = self._zoom_request
+                    self._zoom_request = None
+                    try:
+                        _set_live_view_zoom(target, context, request)
+                        self._zoom_level = request
+                        logging.info('LiveViewThread: zoom set to %d×', request)
+                    except Exception as exc:
+                        self._zoom_error = str(exc)
+                        logging.warning('LiveViewThread: zoom write failed: %s', exc)
+
                 cam_file = gp.CameraFile()
                 gp.check_result(gp.gp_camera_capture_preview(target, cam_file, context))
                 file_data = gp.check_result(gp.gp_file_get_data_and_size(cam_file))
@@ -1019,11 +1089,42 @@ class LiveViewThread(threading.Thread):
                 if not self._probed:
                     self._probed = True
                     log_live_view_capabilities(self._camera, target, context, frame)
+                dimensions = _jpeg_dimensions(frame)
+                if dimensions:
+                    self._last_dimensions = dimensions
+                    if self._base_dimensions is None and self._zoom_level == 1:
+                        self._base_dimensions = dimensions
                 self._frame_callback(frame)
             except gphoto2.GPhoto2Error as exc:
                 logging.debug('LiveViewThread: preview capture failed: %s', exc)
             except Exception:
                 logging.exception('LiveViewThread: unexpected error')
+            finally:
+                if acquired:
+                    try:
+                        self._camera._usb_lock.release()
+                    except Exception:
+                        pass
+
+        # Leave the camera unzoomed so the next live-view session (or the naked-eye
+        # framing on the body's screen) starts from the full view.
+        if not _has_virtual_preview and self._zoom_level != 1:
+            acquired = False
+            try:
+                acquired = self._camera._usb_lock.acquire(timeout=1.0)
+                if acquired:
+                    _set_live_view_zoom(target, context, 1)
+                    # The 80D switches streams lazily, on the next couple of preview
+                    # captures — without these the body stays zoomed after the write
+                    # (hardware-verified).
+                    for _ in range(5):
+                        cam_file = gp.CameraFile()
+                        gp.check_result(gp.gp_camera_capture_preview(target, cam_file, context))
+                        frame = bytes(gp.check_result(gp.gp_file_get_data_and_size(cam_file)))
+                        if self._base_dimensions and _jpeg_dimensions(frame) == self._base_dimensions:
+                            break
+            except Exception as exc:
+                logging.debug('LiveViewThread: zoom reset on stop failed: %s', exc)
             finally:
                 if acquired:
                     try:

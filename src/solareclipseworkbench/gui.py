@@ -43,7 +43,7 @@ import threading
 
 from solareclipseworkbench.camera import get_camera_dict, get_battery_level, get_free_space, get_space, \
     get_shooting_mode, get_focus_mode, set_time, CameraSettings, LiveViewThread, \
-    sony_save_destination_needs_downloader
+    sony_save_destination_needs_downloader, LIVE_VIEW_ZOOM_LEVELS, VirtualCamera
 from solareclipseworkbench.observer import Observer, Observable
 from solareclipseworkbench.shot_events import BUS, ShotEvent, ShotOutcome
 from solareclipseworkbench import shot_log
@@ -2227,11 +2227,19 @@ class LiveViewWindow(QWidget):
         # Buttons
         self._toggle_btn = QPushButton("Disable Live View")
         self._toggle_btn.clicked.connect(self._on_toggle)
+        self._zoom_requested: int = 1
+        self._zoom_btn = QPushButton()
+        self._zoom_btn.clicked.connect(self._on_zoom)
+        if isinstance(camera, VirtualCamera):
+            self._zoom_btn.setEnabled(False)
+            self._zoom_btn.setToolTip("Zoom needs a physical camera")
+        self._update_zoom_button()
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.close)
 
         btn_layout = QHBoxLayout()
         btn_layout.addWidget(self._toggle_btn)
+        btn_layout.addWidget(self._zoom_btn)
         btn_layout.addWidget(close_btn)
 
         layout = QVBoxLayout()
@@ -2262,6 +2270,8 @@ class LiveViewWindow(QWidget):
             interval_s=1.0,
         )
         self._thread.start()
+        self._zoom_requested = 1
+        self._update_zoom_button()
         self._update_status_label()
 
     def _on_frame(self, jpeg_bytes: bytes):
@@ -2305,6 +2315,15 @@ class LiveViewWindow(QWidget):
         painter.end()
         self._image_label.setPixmap(scaled)
         self._timestamp_label.setText("Last frame: " + ts.strftime("%Y-%m-%d  %H:%M:%S"))
+        # Zoom state only shows up in frame dimensions, so refresh with each frame.
+        thread = self._thread
+        if thread is not None:
+            if thread.zoom_error and self._zoom_requested != thread.zoom_level:
+                self._zoom_requested = thread.zoom_level
+                self._update_zoom_button()
+                self._update_status_label()
+            elif self._zoom_requested != 1 or thread.zoom_level != 1:
+                self._update_status_label()
 
     def _apply_state(self):
         """Push the user+totality state into the thread and refresh the button."""
@@ -2328,7 +2347,16 @@ class LiveViewWindow(QWidget):
             )
             self._status_label.setStyleSheet("color: #856404; background: #FFF3CD; padding: 3px; border-radius: 3px;")
         else:
-            self._status_label.setText("\u25cf  Active")
+            text = "\u25cf  Active"
+            thread = self._thread
+            if thread is not None:
+                if thread.zoom_error:
+                    text += "  \u2014  zoom unavailable"
+                elif self._zoom_requested != 1 or thread.zoom_engaged:
+                    text += f"  \u2014  zoom {self._zoom_requested}\u00d7"
+                    if (self._zoom_requested != 1) != thread.zoom_engaged:
+                        text += " (switching\u2026)"
+            self._status_label.setText(text)
             self._status_label.setStyleSheet("color: green;")
 
     # ------------------------------------------------------------------
@@ -2349,6 +2377,21 @@ class LiveViewWindow(QWidget):
     def _on_toggle(self):
         self._user_enabled = not self._user_enabled
         self._apply_state()
+
+    def _on_zoom(self):
+        if self._thread is None:
+            return
+        levels = LIVE_VIEW_ZOOM_LEVELS
+        next_level = levels[(levels.index(self._zoom_requested) + 1) % len(levels)]
+        if self._thread.request_zoom(next_level):
+            self._zoom_requested = next_level
+            self._update_zoom_button()
+            self._update_status_label()
+
+    def _update_zoom_button(self):
+        levels = LIVE_VIEW_ZOOM_LEVELS
+        next_level = levels[(levels.index(self._zoom_requested) + 1) % len(levels)]
+        self._zoom_btn.setText(f"Zoom {next_level}×")
 
     def closeEvent(self, event):
         self._poll_timer.stop()
