@@ -66,6 +66,118 @@ def _normalise_aperture(value: str) -> str:
 _aperture_verified: dict[str, set] = {}
 
 
+# Widget names that toggle live view, generic name first and the Canon EOS name as
+# fallback.  Nothing in this codebase wrote either of them before the live-view
+# capability probe below, so the names, types and value ranges a given body actually
+# accepts are established by running the probe against it rather than assumed here.
+_VIEWFINDER_WIDGET_NAMES = ('eosviewfinder', 'viewfinder')
+
+# Widgets the probe reports on so the magnification work has real values to build on.
+_LIVE_VIEW_PROBE_WIDGETS = _VIEWFINDER_WIDGET_NAMES + ('eoszoom', 'eoszoomposition')
+
+
+def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Return (width, height) of a JPEG, or None when the markers cannot be read.
+
+    Scans for a Start Of Frame marker rather than decoding, so it costs a few
+    microseconds and pulls in no image library.  The live-view worker calls this,
+    and that thread must never touch Qt.
+    """
+    # SOF0..SOF15, minus the four markers in that range that are not frame headers.
+    sof_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                   0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+    if len(data) < 4 or data[0] != 0xFF or data[1] != 0xD8:
+        return None
+
+    offset = 2
+    while offset + 3 < len(data):
+        if data[offset] != 0xFF:
+            offset += 1
+            continue
+        marker = data[offset + 1]
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            offset += 2
+            continue
+        segment_length = int.from_bytes(data[offset + 2:offset + 4], 'big')
+        if marker in sof_markers:
+            if offset + 9 > len(data):
+                return None
+            height = int.from_bytes(data[offset + 5:offset + 7], 'big')
+            width = int.from_bytes(data[offset + 7:offset + 9], 'big')
+            return width, height
+        if segment_length < 2:
+            return None
+        offset += 2 + segment_length
+    return None
+
+
+def _describe_widget(target, name, context) -> str | None:
+    """One-line description of a config widget, or None when the body lacks it.
+
+    Reports the widget's type plus whatever bounds it exposes -- the choice list for
+    a radio/menu, the min/max/step for a range -- because those are exactly the facts
+    that decide how live-view magnification has to be driven on a given body.
+    """
+    # Broad catches throughout: this is diagnostics, and one widget the driver
+    # mishandles must not abort the rest of the probe.
+    try:
+        widget = gp.check_result(gp.gp_camera_get_single_config(target, name, context))
+    except Exception:
+        return None
+
+    try:
+        widget_type = gp.check_result(gp.gp_widget_get_type(widget))
+    except Exception:
+        return f"{name}: present, type unreadable"
+
+    parts = [f"{name}: type={widget_type}"]
+
+    try:
+        parts.append(f"value={gp.check_result(gp.gp_widget_get_value(widget))!r}")
+    except Exception:
+        pass
+
+    try:
+        count = gp.check_result(gp.gp_widget_count_choices(widget))
+        if count:
+            choices = [gp.check_result(gp.gp_widget_get_choice(widget, index))
+                       for index in range(count)]
+            parts.append(f"choices={choices}")
+    except Exception:
+        pass
+
+    try:
+        parts.append("range=%s" % (gp.check_result(gp.gp_widget_get_range(widget)),))
+    except Exception:
+        pass
+
+    return ", ".join(parts)
+
+
+def log_live_view_capabilities(camera, target, context, frame: bytes) -> None:
+    """Log what this body exposes for live view.  Read-only; never raises.
+
+    Called once per live-view session, on the first frame.  The preview dimensions
+    it records are what converts a measurement in preview pixels into sensor pixels
+    and arcseconds, so they are logged rather than assumed.
+    """
+    try:
+        name = getattr(camera, 'name', '?')
+        dimensions = _jpeg_dimensions(frame)
+        logging.info(
+            'live view probe [%s]: preview %s, %d bytes',
+            name,
+            f'{dimensions[0]}x{dimensions[1]}' if dimensions else 'dimensions unreadable',
+            len(frame),
+        )
+        for widget_name in _LIVE_VIEW_PROBE_WIDGETS:
+            description = _describe_widget(target, widget_name, context)
+            logging.info('live view probe [%s]: %s',
+                         name, description or f'{widget_name}: absent')
+    except Exception:
+        logging.exception('live view probe failed')
+
+
 class CameraSettings:
 
     def __init__(self, camera_name: str, shutter_speed: str, aperture: str, iso: int):
@@ -845,6 +957,7 @@ class LiveViewThread(threading.Thread):
         self._lock_timeout = lock_timeout
         self._stop_event = threading.Event()
         self._paused = threading.Event()
+        self._probed = False
 
     def stop(self):
         """Signal the thread to stop and wait briefly for it to exit."""
@@ -902,7 +1015,11 @@ class LiveViewThread(threading.Thread):
                 cam_file = gp.CameraFile()
                 gp.check_result(gp.gp_camera_capture_preview(target, cam_file, context))
                 file_data = gp.check_result(gp.gp_file_get_data_and_size(cam_file))
-                self._frame_callback(bytes(file_data))
+                frame = bytes(file_data)
+                if not self._probed:
+                    self._probed = True
+                    log_live_view_capabilities(self._camera, target, context, frame)
+                self._frame_callback(frame)
             except gphoto2.GPhoto2Error as exc:
                 logging.debug('LiveViewThread: preview capture failed: %s', exc)
             except Exception:
