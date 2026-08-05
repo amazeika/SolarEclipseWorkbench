@@ -45,6 +45,9 @@ import threading
 from solareclipseworkbench.camera import get_camera_dict, get_battery_level, get_free_space, get_space, \
     get_shooting_mode, get_focus_mode, set_time, CameraSettings, LiveViewThread, \
     sony_save_destination_needs_downloader, LIVE_VIEW_ZOOM_LEVELS, VirtualCamera
+from solareclipseworkbench.centring import (
+    DriftTracker, SkyOrientation, calibrate_from_untracked_drift, fit_solar_disc,
+    offset_from_centre, tolerance_preview_px)
 from solareclipseworkbench.focus_metrics import (
     FocusTracker, RollingEnvelope, grade_edge_width, measure_limb_sharpness)
 from solareclipseworkbench.observer import Observer, Observable
@@ -2336,6 +2339,7 @@ class PreviewView(QGraphicsView):
         self._scene.addItem(self._item)
 
         self._crosshair: list = []
+        self._overlay: list = []
         self._frame_size = None
         self._fit_mode = True
 
@@ -2358,6 +2362,7 @@ class PreviewView(QGraphicsView):
             self._frame_size = size
             self._scene.setSceneRect(0, 0, size[0], size[1])
             self._rebuild_crosshair()
+            self.clear_overlay()
             if self._fit_mode:
                 self.fit()
 
@@ -2378,6 +2383,50 @@ class PreviewView(QGraphicsView):
         for x1, y1, x2, y2 in ((0, height / 2, width, height / 2),
                                (width / 2, 0, width / 2, height)):
             self._crosshair.append(self._scene.addLine(x1, y1, x2, y2, pen))
+
+    # -- centring overlay -----------------------------------------------
+
+    def clear_overlay(self) -> None:
+        for item in self._overlay:
+            self._scene.removeItem(item)
+        self._overlay = []
+
+    def show_centring(self, disc_centre, disc_radius, tolerance, within: bool) -> None:
+        """Draw the fitted limb and the framing tolerance, in image coordinates.
+
+        Scene items rather than paint on the pixmap, so the guides stay one screen
+        pixel wide and stay registered to the image at any zoom.
+        """
+        self.clear_overlay()
+        if not self._frame_size:
+            return
+        width, height = self._frame_size
+        cx, cy = width / 2.0, height / 2.0
+        semi_x, semi_y = tolerance
+
+        # Amber once the corona would clip; the tolerance is only worth drawing if it
+        # says something when crossed.
+        colour = QColor(0, 200, 120) if within else QColor(230, 160, 0)
+
+        pen = QPen(colour)
+        pen.setWidth(0)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        self._overlay.append(self._scene.addEllipse(
+            cx - semi_x, cy - semi_y, semi_x * 2, semi_y * 2, pen))
+
+        limb_pen = QPen(QColor(0, 120, 255))
+        limb_pen.setWidth(0)
+        self._overlay.append(self._scene.addEllipse(
+            disc_centre[0] - disc_radius, disc_centre[1] - disc_radius,
+            disc_radius * 2, disc_radius * 2, limb_pen))
+
+        marker_pen = QPen(colour)
+        marker_pen.setWidth(0)
+        span = max(6.0, disc_radius * 0.08)
+        for x1, y1, x2, y2 in (
+                (disc_centre[0] - span, disc_centre[1], disc_centre[0] + span, disc_centre[1]),
+                (disc_centre[0], disc_centre[1] - span, disc_centre[0], disc_centre[1] + span)):
+            self._overlay.append(self._scene.addLine(x1, y1, x2, y2, marker_pen))
 
     # -- zoom -----------------------------------------------------------
 
@@ -2485,6 +2534,19 @@ class LiveViewWindow(QWidget):
         self._focus_hint_label = QLabel()
         self._focus_hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        # Centring readout
+        self._drift_tracker = DriftTracker()
+        self._sky = SkyOrientation()
+        self._calibrating_until: float | None = None
+        self._centring_label = QLabel()
+        self._centring_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._centring_label.setStyleSheet("font-family: monospace;")
+        self._calibrate_btn = QPushButton("Calibrate sky")
+        self._calibrate_btn.setToolTip(
+            "Learn which way the frame is pointing, so drift can be reported as "
+            "north/south/east/west instead of an image angle")
+        self._calibrate_btn.clicked.connect(self._on_calibrate_sky)
+
         # Timestamp of last received frame
         self._timestamp_label = QLabel()
         self._timestamp_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2510,12 +2572,14 @@ class LiveViewWindow(QWidget):
         btn_layout = QHBoxLayout()
         btn_layout.addWidget(self._toggle_btn)
         btn_layout.addWidget(self._zoom_btn)
+        btn_layout.addWidget(self._calibrate_btn)
         btn_layout.addWidget(close_btn)
 
         layout = QVBoxLayout()
         layout.addWidget(self._waiting_label)
         layout.addWidget(self._view, stretch=1)
         layout.addLayout(self._scale_buttons)
+        layout.addWidget(self._centring_label)
         layout.addWidget(self._sharpness_label)
         layout.addWidget(self._focus_hint_label)
         layout.addWidget(self._timestamp_label)
@@ -2590,7 +2654,14 @@ class LiveViewWindow(QWidget):
             self._view.setVisible(True)
             self._waiting_label.setVisible(False)
         self._timestamp_label.setText("Last frame: " + ts.strftime("%Y-%m-%d  %H:%M:%S"))
-        self._update_sharpness(image, ts)
+
+        try:
+            grey = _qimage_to_grey(image)
+        except Exception:
+            LOGGER.exception("Could not convert the preview frame for measurement")
+            return
+        self._update_centring(grey, ts)
+        self._update_sharpness(grey, ts)
         # Zoom state only shows up in frame dimensions, so refresh with each frame.
         thread = self._thread
         if thread is not None:
@@ -2601,7 +2672,129 @@ class LiveViewWindow(QWidget):
             elif self._zoom_requested != 1 or thread.zoom_level != 1:
                 self._update_status_label()
 
-    def _update_sharpness(self, image: QImage, ts) -> None:
+    #: How long the untracked run has to be to pin the frame to the sky.  Long enough
+    #: that the disc fit's own jitter cannot rotate the answer, short enough that the
+    #: sun stays in frame with the drive stopped.
+    SKY_CALIBRATION_S = 30.0
+
+    def _on_calibrate_sky(self):
+        """Start (or cancel) learning the frame's orientation from untracked drift."""
+        if self._calibrating_until is not None:
+            self._calibrating_until = None
+            self._calibrate_btn.setText("Calibrate sky")
+            return
+
+        if self._zoom_requested != 1:
+            QMessageBox.information(
+                self, "Zoom out first",
+                "Sky calibration needs the whole disc in frame.  Switch to 1× and "
+                "try again.")
+            return
+
+        answer = QMessageBox.question(
+            self, "Calibrate sky orientation",
+            "Switch the mount's tracking OFF, then continue.\n\n"
+            "With the drive stopped the sun drifts due west, so watching it for "
+            f"{self.SKY_CALIBRATION_S:.0f} seconds tells Solar Eclipse Workbench which "
+            "way the frame is pointing.  Drift can then be reported as north/south/"
+            "east/west instead of an angle in the image.\n\n"
+            "Turn tracking back on when it finishes.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Ok:
+            return
+
+        # A fresh baseline: any samples taken while tracking was still on describe a
+        # different motion and would rotate the result.
+        self._drift_tracker.clear()
+        self._calibrating_until = datetime.datetime.now().timestamp() + self.SKY_CALIBRATION_S
+        self._calibrate_btn.setText("Cancel")
+
+    def _finish_sky_calibration(self, drift) -> str:
+        """Consume a drift reading during calibration; returns a line for the label."""
+        remaining = self._calibrating_until - datetime.datetime.now().timestamp()
+        if remaining > 0:
+            return f"Calibrating sky — tracking off, {remaining:.0f}s remaining"
+
+        if drift is None:
+            self._calibrating_until = None
+            self._calibrate_btn.setText("Calibrate sky")
+            return "Sky calibration failed — no drift measured; was tracking off?"
+
+        arcsec_per_min, bearing = drift
+        self._calibrating_until = None
+        self._calibrate_btn.setText("Re-calibrate sky")
+        # Too slow to trust: with the drive stopped this should be near sidereal, and
+        # a small number means the mount was still tracking, so the bearing is noise.
+        if arcsec_per_min < 100.0:
+            self._sky = SkyOrientation()
+            return (f"Sky calibration failed — only {arcsec_per_min:.0f}\"/min of "
+                    "drift; leave tracking off and retry")
+        self._sky = calibrate_from_untracked_drift(bearing)
+        return f"Sky calibrated — west is {bearing:.0f}° in frame; tracking back on"
+
+    def _update_centring(self, grey: np.ndarray, ts) -> None:
+        """Fit the solar disc and report where it sits and where it is going.
+
+        Only at 1x, where the whole disc is in frame.  A magnified crop shows an arc,
+        and a circle fitted through a short arc has a wildly uncertain centre.
+        """
+        if self._zoom_requested != 1:
+            self._centring_label.clear()
+            self._view.clear_overlay()
+            self._drift_tracker.clear()
+            return
+
+        height, width = grey.shape
+        try:
+            fit = fit_solar_disc(grey)
+        except Exception:
+            LOGGER.exception("Solar disc fit failed")
+            return
+
+        if fit is None:
+            self._centring_label.setText("Centring — no solar disc in frame")
+            self._centring_label.setStyleSheet("font-family: monospace; color: gray;")
+            self._view.clear_overlay()
+            self._drift_tracker.clear()
+            return
+
+        dx, dy, dx_arcmin, dy_arcmin, within = offset_from_centre(
+            fit, (width, height), width)
+        self._view.show_centring(fit.centre, fit.radius,
+                                 tolerance_preview_px(width), within)
+
+        self._drift_tracker.add(fit.centre, ts.timestamp())
+        drift = self._drift_tracker.drift(width)
+
+        if self._calibrating_until is not None:
+            self._centring_label.setText(self._finish_sky_calibration(drift))
+            self._centring_label.setStyleSheet("font-family: monospace;")
+            return
+
+        if drift is None:
+            drift_text = "drift —"
+        else:
+            arcsec_per_min, bearing = drift
+            direction = self._sky.describe(bearing)
+            if direction is None:
+                # Without a calibration the frame's orientation is unknown, so this
+                # stays an image angle rather than pretending to name a sky direction.
+                drift_text = (f"drift {arcsec_per_min:6.1f}\"/min "
+                              f"at {bearing:3.0f}° in frame")
+            else:
+                north, _ = self._sky.components(arcsec_per_min, bearing)
+                drift_text = (f"drift {arcsec_per_min:6.1f}\"/min {direction} "
+                              f"({north:+.1f}\"/min N–S)")
+
+        self._centring_label.setText(
+            f"Offset {dx:+6.0f}, {dy:+6.0f} px "
+            f"({dx_arcmin:+5.1f}, {dy_arcmin:+5.1f}′)   ·   {drift_text}")
+        self._centring_label.setStyleSheet(
+            "font-family: monospace;" if within else
+            "font-family: monospace; color: #856404; background: #FFF3CD;"
+            " padding: 3px; border-radius: 3px;")
+
+    def _update_sharpness(self, grey: np.ndarray, ts) -> None:
         """Measure the limb on this frame and refresh the focus readout.
 
         Only at 5x.  At 1x the disc spans ~150 preview pixels and a focused limb
@@ -2619,7 +2812,7 @@ class LiveViewWindow(QWidget):
             return
 
         try:
-            result = measure_limb_sharpness(_qimage_to_grey(image))
+            result = measure_limb_sharpness(grey)
         except Exception:
             LOGGER.exception("Limb sharpness measurement failed")
             return
@@ -2743,6 +2936,7 @@ class LiveViewWindow(QWidget):
             # bracketed minimum.
             self._sharpness_envelope.clear()
             self._focus_tracker.clear()
+            self._drift_tracker.clear()
             self._update_zoom_button()
             self._update_status_label()
 

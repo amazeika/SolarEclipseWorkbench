@@ -138,6 +138,45 @@ def test_the_reticle_is_rebuilt_on_the_new_frame_size(view):
     assert horizontal.line().y1() == pytest.approx(400)
 
 
+def test_the_centring_overlay_draws_the_limb_and_the_tolerance(view):
+    view.set_frame(_frame(960, 640))
+
+    view.show_centring((480.0, 320.0), 75.0, (177.0, 17.0), within=True)
+
+    # Tolerance ellipse, fitted limb, and two centre-marker lines.
+    assert len(view._overlay) == 4
+
+
+def test_the_overlay_warns_when_the_corona_would_clip(view):
+    view.set_frame(_frame(960, 640))
+
+    view.show_centring((480.0, 260.0), 75.0, (177.0, 17.0), within=False)
+    outside = view._overlay[0].pen().color().name()
+    view.show_centring((480.0, 320.0), 75.0, (177.0, 17.0), within=True)
+    inside = view._overlay[0].pen().color().name()
+
+    assert outside != inside, "the tolerance ring says the same thing either way"
+
+
+def test_the_overlay_does_not_accumulate_across_frames(view):
+    view.set_frame(_frame(960, 640))
+
+    for _ in range(5):
+        view.show_centring((480.0, 320.0), 75.0, (177.0, 17.0), within=True)
+
+    assert len(view._overlay) == 4
+
+
+def test_a_camera_zoom_change_drops_a_stale_overlay(view):
+    """The 1x fit describes the whole disc; at 5x those coordinates mean nothing."""
+    view.set_frame(_frame(960, 640))
+    view.show_centring((480.0, 320.0), 75.0, (177.0, 17.0), within=True)
+
+    view.set_frame(_frame(1200, 800))
+
+    assert view._overlay == []
+
+
 def _wheel(delta):
     from PyQt6.QtCore import QPoint, QPointF
     from PyQt6.QtGui import QWheelEvent
