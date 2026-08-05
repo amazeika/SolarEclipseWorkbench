@@ -45,6 +45,8 @@ import threading
 from solareclipseworkbench.camera import get_camera_dict, get_battery_level, get_free_space, get_space, \
     get_shooting_mode, get_focus_mode, set_time, CameraSettings, LiveViewThread, \
     sony_save_destination_needs_downloader, LIVE_VIEW_ZOOM_LEVELS, VirtualCamera
+from solareclipseworkbench.focus_metrics import (
+    FocusTracker, RollingEnvelope, grade_edge_width, measure_limb_sharpness)
 from solareclipseworkbench.observer import Observer, Observable
 from solareclipseworkbench.shot_events import BUS, ShotEvent, ShotOutcome
 from solareclipseworkbench import shot_log
@@ -2292,6 +2294,21 @@ def live_view_locked_out(now_utc, c2_info, c3_info) -> bool:
         (c3_info.time_utc + LIVE_VIEW_LOCKOUT_TRAIL)
 
 
+def _qimage_to_grey(image: QImage) -> np.ndarray:
+    """QImage -> 2-D float array of luminance, without a copy per channel.
+
+    Qt's Grayscale8 conversion does the colour maths in C, which matters at 10 fps on
+    a 1200x800 frame.  The row stride is honoured because Qt pads rows to a 4-byte
+    boundary and ignoring it shears the image.
+    """
+    grey = image.convertToFormat(QImage.Format.Format_Grayscale8)
+    width, height = grey.width(), grey.height()
+    buffer = grey.constBits()
+    buffer.setsize(grey.sizeInBytes())
+    return np.frombuffer(buffer, dtype=np.uint8).reshape(
+        height, grey.bytesPerLine())[:, :width].astype(np.float64)
+
+
 class PreviewView(QGraphicsView):
     """Pan/zoom viewer for live-view frames.
 
@@ -2459,6 +2476,15 @@ class LiveViewWindow(QWidget):
             button.clicked.connect(action)
             self._scale_buttons.addWidget(button)
 
+        # Focus readout
+        self._sharpness_envelope = RollingEnvelope()
+        self._focus_tracker = FocusTracker()
+        self._sharpness_label = QLabel()
+        self._sharpness_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._sharpness_label.setStyleSheet("font-family: monospace;")
+        self._focus_hint_label = QLabel()
+        self._focus_hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
         # Timestamp of last received frame
         self._timestamp_label = QLabel()
         self._timestamp_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2490,6 +2516,8 @@ class LiveViewWindow(QWidget):
         layout.addWidget(self._waiting_label)
         layout.addWidget(self._view, stretch=1)
         layout.addLayout(self._scale_buttons)
+        layout.addWidget(self._sharpness_label)
+        layout.addWidget(self._focus_hint_label)
         layout.addWidget(self._timestamp_label)
         layout.addWidget(self._status_label)
         layout.addLayout(btn_layout)
@@ -2562,6 +2590,7 @@ class LiveViewWindow(QWidget):
             self._view.setVisible(True)
             self._waiting_label.setVisible(False)
         self._timestamp_label.setText("Last frame: " + ts.strftime("%Y-%m-%d  %H:%M:%S"))
+        self._update_sharpness(image, ts)
         # Zoom state only shows up in frame dimensions, so refresh with each frame.
         thread = self._thread
         if thread is not None:
@@ -2571,6 +2600,63 @@ class LiveViewWindow(QWidget):
                 self._update_status_label()
             elif self._zoom_requested != 1 or thread.zoom_level != 1:
                 self._update_status_label()
+
+    def _update_sharpness(self, image: QImage, ts) -> None:
+        """Measure the limb on this frame and refresh the focus readout.
+
+        Only at 5x.  At 1x the disc spans ~150 preview pixels and a focused limb
+        transition is sub-pixel, so the number would describe JPEG compression rather
+        than focus -- worse than showing nothing, because it looks authoritative.
+        """
+        if self._zoom_requested == 1:
+            self._sharpness_label.setText(
+                "Limb edge width — zoom to 5× to measure focus")
+            self._sharpness_label.setStyleSheet("font-family: monospace; color: gray;")
+            self._focus_hint_label.clear()
+            # History from a different magnification does not describe this view.
+            self._sharpness_envelope.clear()
+            self._focus_tracker.clear()
+            return
+
+        try:
+            result = measure_limb_sharpness(_qimage_to_grey(image))
+        except Exception:
+            LOGGER.exception("Limb sharpness measurement failed")
+            return
+
+        if result.clipped:
+            self._sharpness_label.setText(
+                f"⚠  {result.clipped_fraction:.1%} of the crop is blown — "
+                "reduce live-view exposure; a clipped limb reads falsely sharp")
+            self._sharpness_label.setStyleSheet(
+                "font-family: monospace; color: #856404; background: #FFF3CD;"
+                " padding: 3px; border-radius: 3px;")
+            return
+
+        if not result.ok:
+            self._sharpness_label.setText(f"Limb edge width — {result.reason}")
+            self._sharpness_label.setStyleSheet("font-family: monospace; color: gray;")
+            return
+
+        now = ts.timestamp()
+        best = self._sharpness_envelope.add(result.edge_width_px, now)
+        # The tracker reads the envelope, not the raw value: seeing swings single
+        # frames by 2x and would flip the direction hint at random.
+        self._focus_tracker.add(best, now)
+
+        session_best = self._focus_tracker.minimum
+        self._sharpness_label.setText(
+            f"Limb edge width  {best:5.2f} px  ({grade_edge_width(best)})"
+            f"   ·  best this session {session_best:5.2f} px")
+        self._sharpness_label.setStyleSheet("font-family: monospace;")
+
+        state = self._focus_tracker.state
+        self._focus_hint_label.setText(self._focus_tracker.describe(current=best))
+        self._focus_hint_label.setStyleSheet({
+            FocusTracker.IMPROVING: "color: #155724;",
+            FocusTracker.WORSENING: "color: #856404;",
+            FocusTracker.BRACKETED: "color: #155724; font-weight: bold;",
+        }.get(state, "color: gray;"))
 
     def _apply_state(self):
         """Push the user and lockout state into the thread and refresh the controls."""
@@ -2652,6 +2738,11 @@ class LiveViewWindow(QWidget):
         next_level = levels[(levels.index(self._zoom_requested) + 1) % len(levels)]
         if self._thread.request_zoom(next_level):
             self._zoom_requested = next_level
+            # Readings taken at the other magnification describe a different image
+            # scale, so carrying them across would corrupt both the envelope and the
+            # bracketed minimum.
+            self._sharpness_envelope.clear()
+            self._focus_tracker.clear()
             self._update_zoom_button()
             self._update_status_label()
 
