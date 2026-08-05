@@ -27,7 +27,7 @@ import pytz
 from PyQt6.QtCore import QTimer, QRect, Qt, QAbstractTableModel, QModelIndex, QSettings, pyqtSignal, QObject
 from PyQt6.QtGui import QIcon, QAction, QIntValidator, QCloseEvent, QPixmap, QImage, QPainter, QPen, QColor, QBrush
 from PyQt6.QtWidgets import QMainWindow, QApplication, QWidget, QFrame, QLabel, QHBoxLayout, QVBoxLayout, QGridLayout, \
-    QGroupBox, QComboBox, QPushButton, QLineEdit, QFileDialog, QScrollArea, QTableView, QMessageBox
+    QGroupBox, QComboBox, QPushButton, QLineEdit, QFileDialog, QScrollArea, QTableView, QMessageBox, QCheckBox
 from PyQt6 import QtWidgets
 from apscheduler.job import Job
 from apscheduler.schedulers import SchedulerNotRunningError
@@ -344,6 +344,7 @@ class SolarEclipseView(QMainWindow, Observable):
 
         self.date_format = list(DATE_FORMATS.keys())[0]
         self.time_format = list(TIME_FORMATS.keys())[0]
+        self.live_view_enabled = True
 
         self.toolbar = None
         self.location_action = QAction("Location", self)
@@ -529,6 +530,10 @@ class SolarEclipseView(QMainWindow, Observable):
 
         self.settings.setValue("date_format", self.date_format)
         self.settings.setValue("time_format", self.time_format)
+
+        # Live view
+
+        self.settings.setValue("live_view_enabled", self.live_view_enabled)
 
     def init_ui(self):
         """ Add all components to the UI. """
@@ -760,7 +765,8 @@ class SolarEclipseView(QMainWindow, Observable):
 
         # Live View
 
-        self.live_view_action.setStatusTip("Open live view window (1 fps preview from camera)")
+        self.live_view_action.setStatusTip(
+            "Open live view window (locked out while the solar filter is off)")
         self.live_view_action.setIcon(QIcon(str(ICON_PATH / "camera.png")))
         self.live_view_action.triggered.connect(self.on_toolbar_button_click)
         self.toolbar.addAction(self.live_view_action)
@@ -1029,18 +1035,11 @@ class SolarEclipseController(Observer):
         self.view.update_time(current_time_local, current_time_utc, countdown_c1, countdown_c2, countdown_max,
                               countdown_c3, countdown_c4, countdown_sunrise, countdown_sunset)
 
-        # Auto-pause live view 15 s before C2 until 15 s after C3 so scheduled
-        # shots around second and third contact have uncontested USB access.
+        # Lock live view out while the solar filter is off.  Same predicate the window
+        # consults when it opens, so the two cannot drift apart.
         if self._live_view_window is not None:
-            c2 = self.model.c2_info
-            c3 = self.model.c3_info
-            _MARGIN = datetime.timedelta(seconds=15)
-            in_totality = (
-                c2 is not None
-                and c3 is not None
-                and (c2.time_utc - _MARGIN) <= current_time_utc <= (c3.time_utc + _MARGIN)
-            )
-            self._live_view_window.set_totality_paused(in_totality)
+            self._live_view_window.set_locked_out(live_view_locked_out(
+                current_time_utc, self.model.c2_info, self.model.c3_info))
 
         # self.view.eclipse_visualization.plot(current_time_utc)    FIXME
 
@@ -1146,6 +1145,10 @@ class SolarEclipseController(Observer):
 
             time_format = changed_object.time_combobox.currentText()
             self.view.time_format = time_format
+
+            self.view.live_view_enabled = changed_object.live_view_checkbox.isChecked()
+            if not self.view.live_view_enabled and self._live_view_window is not None:
+                self._live_view_window.close()
 
             if self.model.c1_info:
                 self.view.c1_time_utc_label.setText(format_time(self.model.c1_info.time_utc, time_format))
@@ -1381,6 +1384,16 @@ class SolarEclipseController(Observer):
         is shown so the user can pick which one to preview.
         Shows a warning when no real camera is connected.
         """
+        # The operator kill switch is checked here rather than inside the window so
+        # that turning it off means the camera is not contacted at all.
+        if not self.view.live_view_enabled:
+            QMessageBox.information(
+                self.view, "Live view disabled",
+                "Live view is turned off in Settings → Datetime format.\n\n"
+                "Re-enable it there to open the preview window.",
+            )
+            return
+
         # If window already exists, bring it to the front
         if self._live_view_window is not None and self._live_view_window.isVisible():
             self._live_view_window.activateWindow()
@@ -1427,8 +1440,23 @@ class SolarEclipseController(Observer):
                 return
             camera = dict(real_cameras)[chosen]
 
-        self._live_view_window = LiveViewWindow(camera, parent=None)
+        # Decide the lockout here rather than waiting for the next 1 Hz tick: a window
+        # opened inside the filter-off span would otherwise grab a frame first, and
+        # that frame is what puts the mirror up.
+        locked_out = live_view_locked_out(
+            datetime.datetime.now(datetime.timezone.utc),
+            self.model.c2_info, self.model.c3_info)
+
+        self._live_view_window = LiveViewWindow(
+            camera, parent=None, locked_out=locked_out,
+            next_event_provider=lambda: seconds_to_next_camera_job(self.scheduler),
+        )
+        self._live_view_window.closed.connect(self._on_live_view_closed)
         self._live_view_window.show()
+
+    def _on_live_view_closed(self):
+        """Drop the reference so the 1 Hz tick stops driving a closed window."""
+        self._live_view_window = None
 
     def load_settings(self):
         """ Load the UI settings.
@@ -1454,6 +1482,11 @@ class SolarEclipseController(Observer):
         default_time_format, *_ = TIME_FORMATS
         time_format = self.view.settings.value("time_format", default_time_format, type=str)
         self.set_datetime_format(date_format, time_format)
+
+        # Live view
+
+        self.view.live_view_enabled = self.view.settings.value(
+            "live_view_enabled", True, type=bool)
 
         # Location
 
@@ -1865,12 +1898,22 @@ class SettingsPopup(QWidget, Observable):
         self.date_combobox.setCurrentText(observer.view.date_format)
         self.time_combobox.setCurrentText(observer.view.time_format)
 
+        # Field fallback: unticking this makes the Live View toolbar button refuse to
+        # open, so the camera is never touched for preview at all.  One click, no
+        # restart -- which is the point on eclipse morning.
+        self.live_view_checkbox = QCheckBox("Enable live view")
+        self.live_view_checkbox.setToolTip(
+            "Untick to stop the Live View window from opening or contacting the camera"
+        )
+        self.live_view_checkbox.setChecked(observer.view.live_view_enabled)
+        layout.addWidget(self.live_view_checkbox, 2, 0, 1, 2)
+
         ok_button = QPushButton("OK")
         ok_button.clicked.connect(self.accept_settings)
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.cancel_settings)
-        layout.addWidget(ok_button, 2, 0)
-        layout.addWidget(cancel_button, 2, 1)
+        layout.addWidget(ok_button, 3, 0)
+        layout.addWidget(cancel_button, 3, 1)
 
         self.setLayout(layout)
 
@@ -2185,28 +2228,100 @@ class EclipsePlotWidget(QtWidgets.QWidget):
     #         self.ax.text(x, y, label, ha="center", va="center", fontsize=10, color="dimgray")
 
 
+# The solar filter is off from C2-20s to C3+20s.  Live view holds the mirror up and
+# the sensor exposed, so it is locked out across that span with 5 s of margin at each
+# end -- ahead of the operator's hands reaching the filter cell, and behind them
+# leaving it.  Nothing about this window may depend on scheduler state.
+LIVE_VIEW_LOCKOUT_LEAD = datetime.timedelta(seconds=25)
+LIVE_VIEW_LOCKOUT_TRAIL = datetime.timedelta(seconds=25)
+
+
+# Preview grab rate.  The 80D sustains 30 fps over USB (33 ms per frame, measured, and
+# magnification costs nothing), so the previous 1 fps was discarding 29 frames out of
+# 30.  10 fps is responsive under the focuser while holding the USB lock only about a
+# third of the time -- a shot that does arrive waits ~33 ms against a 1.5 s budget.
+# Deliberately short of what the body can do: 30 fps buys nothing the eye can use, and
+# hours of full-rate live view warm the sensor, which lands as noise in the totality
+# frames.
+LIVE_VIEW_INTERVAL_S = 0.1
+
+# Frame-queue poll.  Must stay well under the grab interval or the display becomes the
+# bottleneck and the extra frames are fetched over USB only to be dropped.
+LIVE_VIEW_POLL_MS = 33
+
+# Jobs that contend for the camera USB lock.  voice_prompt and execute_command do
+# not touch the camera, so live view has no reason to stand down for them.
+_CAMERA_JOB_FUNCS = frozenset({
+    "take_picture", "take_burst", "take_bracket", "take_hdr", "sync_cameras",
+})
+
+
+def seconds_to_next_camera_job(scheduler) -> float | None:
+    """Seconds until the next scheduled job that needs the camera, or None.
+
+    Reads the running schedule rather than any script on disk, so it is exact for
+    whatever sequence is actually loaded.
+    """
+    if scheduler is None:
+        return None
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        times = [job.next_run_time for job in scheduler.get_jobs()
+                 if job.next_run_time and job.func.__name__ in _CAMERA_JOB_FUNCS]
+        return min((t - now).total_seconds() for t in times) if times else None
+    except Exception:
+        LOGGER.exception("Could not work out the time to the next camera job")
+        return None
+
+
+def live_view_locked_out(now_utc, c2_info, c3_info) -> bool:
+    """True while the solar filter is off, so live view must not run.
+
+    Deliberately not extended to C1 and C4: the filter is on through both, so there is
+    no safety case for locking out there, and the schedule guard covers their tightly
+    spaced contact shots more precisely than a fixed window around the contact could.
+
+    A partial eclipse has no C2 or C3 and never loses its filter, so this is False
+    throughout -- correct, and the reason the check is on the contacts rather than on
+    "is an eclipse happening".
+    """
+    if c2_info is None or c3_info is None:
+        return False
+    return (c2_info.time_utc - LIVE_VIEW_LOCKOUT_LEAD) <= now_utc <= \
+        (c3_info.time_utc + LIVE_VIEW_LOCKOUT_TRAIL)
+
+
 class LiveViewWindow(QWidget):
     """Floating window that shows a live-view preview from a gphoto2 camera.
 
-    A background ``LiveViewThread`` grabs one preview frame per second.  When
+    A background ``LiveViewThread`` grabs preview frames at LIVE_VIEW_INTERVAL_S.  When
     the camera USB lock is held by a scheduled shot the frame is silently
     skipped so timing accuracy is never compromised.
 
     The window can be:
       - Disabled/re-enabled at any time via the toggle button.
-      - Auto-paused between C2 and C3 (totality) by the controller calling
-        ``set_totality_paused(True/False)``.
+      - Locked out across the filter-off window by the controller calling
+        ``set_locked_out(True/False)``.  The lockout takes the camera out of live
+        view and refuses to be overridden; it is not merely a pause.
     """
 
-    def __init__(self, camera, parent=None):
+    closed = pyqtSignal()
+
+    def __init__(self, camera, parent=None, locked_out: bool = False,
+                 next_event_provider=None):
         super().__init__(parent, Qt.WindowType.Window)
         self.setMinimumSize(480, 400)
 
         self._camera = camera
+        self._next_event_provider = next_event_provider
+        self._held_shown: int | None = None
         self._thread = None
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._user_enabled: bool = True
-        self._totality_paused: bool = False
+        # Set before the thread starts.  Waiting for the controller's next 1 Hz tick
+        # would let one frame through first, and that frame engages live view on the
+        # body -- mirror up, no filter.
+        self._locked_out: bool = locked_out
 
         self.setWindowTitle(f"Live View — {camera.name}")
 
@@ -2249,9 +2364,9 @@ class LiveViewWindow(QWidget):
         layout.addLayout(btn_layout)
         self.setLayout(layout)
 
-        # Poll the frame queue every 500 ms on the GUI thread
+        # Drain the frame queue on the GUI thread, faster than frames arrive
         self._poll_timer = QTimer(self)
-        self._poll_timer.setInterval(500)
+        self._poll_timer.setInterval(LIVE_VIEW_POLL_MS)
         self._poll_timer.timeout.connect(self._poll_frame)
         self._poll_timer.start()
 
@@ -2267,7 +2382,9 @@ class LiveViewWindow(QWidget):
         self._thread = LiveViewThread(
             camera=self._camera,
             frame_callback=self._on_frame,
-            interval_s=1.0,
+            interval_s=LIVE_VIEW_INTERVAL_S,
+            start_paused=self._locked_out,
+            next_event_provider=self._next_event_provider,
         )
         self._thread.start()
         self._zoom_requested = 1
@@ -2283,6 +2400,16 @@ class LiveViewWindow(QWidget):
 
     def _poll_frame(self):
         """Called on the Qt main thread by the poll timer; updates the image."""
+        # Before the queue check: while the worker is standing down for a shot no
+        # frames arrive at all, and that is exactly when the countdown has to tick.
+        # Only on a whole-second change, since the label is refreshed far more often
+        # than it can say anything new.
+        held = self._thread.held_seconds if self._thread is not None else None
+        shown = None if held is None else int(held)
+        if shown != self._held_shown:
+            self._held_shown = shown
+            self._update_status_label()
+
         try:
             jpeg_bytes, ts = self._frame_queue.get_nowait()
         except queue.Empty:
@@ -2326,26 +2453,38 @@ class LiveViewWindow(QWidget):
                 self._update_status_label()
 
     def _apply_state(self):
-        """Push the user+totality state into the thread and refresh the button."""
-        if self._thread is None:
-            return
-        if self._user_enabled and not self._totality_paused:
-            self._thread.resume()
-            self._toggle_btn.setText("Disable Live View")
-        else:
-            self._thread.pause()
-            self._toggle_btn.setText("Enable Live View")
+        """Push the user and lockout state into the thread and refresh the controls."""
+        if self._thread is not None:
+            if self._user_enabled and not self._locked_out:
+                self._thread.resume()
+            else:
+                self._thread.pause()
+        # Outside the thread guard: after the window closes the thread is gone, and the
+        # button and label must still end up in a state that matches reality.
+        self._toggle_btn.setText(
+            "Disable Live View" if self._user_enabled else "Enable Live View")
+        self._toggle_btn.setEnabled(not self._locked_out)
+        self._zoom_btn.setEnabled(
+            not self._locked_out and not isinstance(self._camera, VirtualCamera))
         self._update_status_label()
 
     def _update_status_label(self):
-        if not self._user_enabled:
+        if self._locked_out:
+            # Ranked above "disabled": this one the operator cannot override, and the
+            # reason is the filter rather than a preference.
+            self._status_label.setText("\U0001f512  Locked out — filter is off")
+            self._status_label.setStyleSheet(
+                "color: #721C24; background: #F8D7DA; padding: 3px; border-radius: 3px;")
+        elif not self._user_enabled:
             self._status_label.setText("○  Disabled")
             self._status_label.setStyleSheet("color: gray;")
-        elif self._totality_paused:
+        elif self._thread is not None and self._thread.held_seconds is not None:
+            # Show the countdown rather than just freezing the image: an operator who
+            # can see the hold waits for it, one who cannot starts clicking.
             self._status_label.setText(
-                "\u23f8  Paused during totality — script has full USB control"
-            )
-            self._status_label.setStyleSheet("color: #856404; background: #FFF3CD; padding: 3px; border-radius: 3px;")
+                f"⏳  Held — next shot in {self._thread.held_seconds:.0f} s")
+            self._status_label.setStyleSheet(
+                "color: #856404; background: #FFF3CD; padding: 3px; border-radius: 3px;")
         else:
             text = "\u25cf  Active"
             thread = self._thread
@@ -2363,11 +2502,15 @@ class LiveViewWindow(QWidget):
     # Public API (called by the controller)
     # ------------------------------------------------------------------
 
-    def set_totality_paused(self, paused: bool):
-        """Auto-pause or auto-resume live view around totality."""
-        if self._totality_paused == paused:
+    def set_locked_out(self, locked_out: bool):
+        """Enter or leave the filter-off lockout.
+
+        Locking out takes the camera out of live view -- mirror down -- and disables
+        the toggle, so the operator cannot re-enable it while the filter is off.
+        """
+        if self._locked_out == locked_out:
             return
-        self._totality_paused = paused
+        self._locked_out = locked_out
         self._apply_state()
 
     # ------------------------------------------------------------------
@@ -2375,6 +2518,10 @@ class LiveViewWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _on_toggle(self):
+        # A disabled QPushButton still fires on a programmatic click(), so refuse here
+        # too rather than relying on the widget being greyed out.
+        if self._locked_out:
+            return
         self._user_enabled = not self._user_enabled
         self._apply_state()
 
@@ -2396,8 +2543,11 @@ class LiveViewWindow(QWidget):
     def closeEvent(self, event):
         self._poll_timer.stop()
         if self._thread is not None:
+            # Blocks briefly: the worker drops out of live view on its way out, and
+            # letting it finish here is what keeps the camera teardown off a race.
             self._thread.stop()
             self._thread = None
+        self.closed.emit()
         event.accept()
 
 

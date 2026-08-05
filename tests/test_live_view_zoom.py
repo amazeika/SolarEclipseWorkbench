@@ -154,6 +154,17 @@ def test_zoom_state_returns_to_disengaged_at_full_view():
     _run_thread(harness, body)
 
 
+def test_ten_times_is_not_offered():
+    """The 80D accepts a write of 10 and reports no error, but the view is identical
+    to 5x.  Offering it would promise magnification the body does not deliver."""
+    assert 10 not in LIVE_VIEW_ZOOM_LEVELS
+
+    thread = LiveViewThread(camera=_GPhotoCameraStub(), frame_callback=lambda b: None)
+
+    assert thread.request_zoom(10) is False
+    assert thread._zoom_request is None
+
+
 def test_failed_zoom_write_reports_error_and_keeps_streaming():
     harness = _ZoomHarness(fail_zoom_write=True)
 
@@ -173,8 +184,8 @@ def test_stop_resets_zoom_to_full_view():
     harness = _ZoomHarness()
 
     def body(thread, frames):
-        thread.request_zoom(10)
-        assert _wait_for(lambda: thread.zoom_level == 10)
+        thread.request_zoom(5)
+        assert _wait_for(lambda: thread.zoom_level == 5)
 
     _run_thread(harness, body)
 

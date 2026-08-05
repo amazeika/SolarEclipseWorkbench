@@ -66,19 +66,130 @@ def _normalise_aperture(value: str) -> str:
 _aperture_verified: dict[str, set] = {}
 
 
-# Widget names that toggle live view, generic name first and the Canon EOS name as
+# Master switch for explicit live-view control.  Set False to restore the behaviour
+# that predates issue #26: no viewfinder writes at all, live view entered implicitly
+# by gp_camera_capture_preview and left engaged until the camera session is torn down.
+# The field fallback if explicit control misbehaves on the day.
+LIVE_VIEW_EXPLICIT_CONTROL: bool = True
+
+# Widget names that toggle live view, Canon's EOS name first and the generic name as
 # fallback.  Nothing in this codebase wrote either of them before the live-view
 # capability probe below, so the names, types and value ranges a given body actually
 # accepts are established by running the probe against it rather than assumed here.
+# (The probe reports the 80D exposing 'viewfinder', reached via the fallback.)
 _VIEWFINDER_WIDGET_NAMES = ('eosviewfinder', 'viewfinder')
+
+# Which viewfinder widget each body exposes: camera name -> widget name, or None once
+# a body has been probed and found to have neither.  A missing key means "not probed".
+# Without this a body that lacks the widget would pay a failed lookup -- a USB
+# round-trip -- on every frame, on the camera that is about to shoot.
+_viewfinder_widget: dict[str, str | None] = {}
+
+
+def reset_live_view_widget_cache() -> None:
+    """Forget which viewfinder widget each body exposes.  For tests."""
+    _viewfinder_widget.clear()
+
+
+def _resolve_viewfinder_widget(camera, target, context) -> str | None:
+    """Name of this body's live-view toggle widget, or None when it has none."""
+    name = getattr(camera, 'name', repr(camera))
+    if name in _viewfinder_widget:
+        return _viewfinder_widget[name]
+
+    resolved = None
+    for candidate in _VIEWFINDER_WIDGET_NAMES:
+        try:
+            gp.check_result(gp.gp_camera_get_single_config(target, candidate, context))
+        except Exception:
+            continue
+        resolved = candidate
+        break
+
+    if resolved is None:
+        logging.info('set_live_view: %s exposes no viewfinder widget; live view will '
+                     'be left to the driver', name)
+    else:
+        logging.debug('set_live_view: %s uses the %s widget', name, resolved)
+    _viewfinder_widget[name] = resolved
+    return resolved
+
+
+def set_live_view(camera, on: bool, context=None) -> bool:
+    """Enter or leave live view.  True when the widget was found and written.
+
+    Live view holds the mirror up and the sensor exposed.  libgphoto2 enters it as a
+    side effect of the first ``gp_camera_capture_preview`` and leaves it engaged until
+    the widget is cleared or the session ends, so leaving it is something this code has
+    to do explicitly -- at a telescope's prime focus that is a sensor-safety matter,
+    not a tidiness one.
+
+    The caller must already hold ``camera._usb_lock``.  This function deliberately does
+    not take it: a helper that locked internally would let a thread that does not own
+    the camera block inside libgphoto2 for as long as a shot takes.
+
+    Never raises.  Bodies without the widget (and the simulator) return False, which
+    callers read as "nothing to undo".
+    """
+    if not LIVE_VIEW_EXPLICIT_CONTROL or isinstance(camera, VirtualCamera):
+        return False
+
+    try:
+        target = camera._camera if hasattr(camera, '_camera') else camera
+        if context is None:
+            context = gp.gp_context_new()
+
+        name = _resolve_viewfinder_widget(camera, target, context)
+        if name is None:
+            return False
+
+        widget = gp.check_result(gp.gp_camera_get_single_config(target, name, context))
+        # Some drivers type the toggle as an int, others as a string.  Match whatever
+        # the widget already holds rather than guessing.
+        current = gp.check_result(gp.gp_widget_get_value(widget))
+        value = ('1' if on else '0') if isinstance(current, str) else (1 if on else 0)
+        gp.check_result(gp.gp_widget_set_value(widget, value))
+        gp.check_result(gp.gp_camera_set_single_config(target, name, widget, context))
+        logging.debug('set_live_view(%s) via %s', on, name)
+        return True
+    except Exception as exc:
+        logging.warning('set_live_view(%s) failed: %s', on, exc)
+        return False
 
 # Widgets the probe reports on so the magnification work has real values to build on.
 _LIVE_VIEW_PROBE_WIDGETS = _VIEWFINDER_WIDGET_NAMES + ('eoszoom', 'eoszoomposition')
 
-# Zoom levels the 80D accepts (hardware-probed, issue #26).  eoszoom is a free-text
+# How long stop() waits for the live-view worker to finish its current frame and run
+# its exit path, and how long disconnect() waits for the USB lock before giving up on
+# a clean exit().  The disconnect budget is deliberately above _MAX_LOCK_WAIT_S: no
+# shot is pending at teardown, so waiting costs nothing that matters.
+_STOP_JOIN_WAIT_S: float = 2.0
+_DISCONNECT_LOCK_WAIT_S: float = 3.0
+
+# Lock budget for the worker's final live-view exit.  Longer than the per-frame
+# timeout because no further frames are coming and the mirror has to come down;
+# still bounded, so a wedged camera cannot hold the app open.
+_LIVE_VIEW_EXIT_WAIT_S: float = 1.0
+
+# How close a scheduled camera job has to be before live view gets out of its way.
+# A shot holds the USB lock for roughly 1.4 s on the 80D, against a 1.5 s drop
+# threshold, so the margin around a tight cluster is a few hundred milliseconds --
+# and each live-view exit and re-entry the driver performs inside trigger_capture
+# eats into it.  Stopping grabs first and only then dropping out of live view lets
+# any in-flight grab finish, so the exit itself is clean.
+LV_GUARD_S: float = 8.0
+LV_EXIT_LEAD_S: float = 3.0
+
+# Zoom levels the 80D honours (hardware-probed, issue #26).  eoszoom is a free-text
 # widget that advertises no choices, and writing an out-of-set value has knocked the
 # body off USB entirely, so every write is validated against this set first.
-LIVE_VIEW_ZOOM_LEVELS = (1, 5, 10)
+#
+# 10 is deliberately absent.  The body accepts the write and reports no error, but the
+# view is identical to 5x -- confirmed by eye, from full view as well as from 5x, so it
+# is not the release-before-changing quirk.  Frame dimensions cannot catch this (5x and
+# 10x both stream 1200x800), which is why an earlier probe read it as working.  At 5x a
+# preview pixel is already one sensor pixel, so nothing is lost.
+LIVE_VIEW_ZOOM_LEVELS = (1, 5)
 
 
 def _set_live_view_zoom(target, context, level: int) -> None:
@@ -424,11 +535,27 @@ class GPhotoCameraAdapter(BaseCamera):
         self._connected = True
 
     def disconnect(self) -> None:
+        # exit() must not run while another thread is inside libgphoto2 -- the live-view
+        # worker holds the same lock for each preview grab, and overlapping the two
+        # segfaults rather than raising.  If the lock cannot be had, skip exit()
+        # entirely: leaking the session is recoverable, tearing it down mid-call is not.
+        acquired = self._usb_lock.acquire(timeout=_DISCONNECT_LOCK_WAIT_S)
         try:
-            self._camera.exit()
-        except Exception:
-            pass
-        self._connected = False
+            if not acquired:
+                logging.warning(
+                    '%s: USB lock still held after %.1fs; skipping exit() rather than '
+                    'racing a gphoto2 call in flight', self.name, _DISCONNECT_LOCK_WAIT_S,
+                )
+                return
+            set_live_view(self, False)
+            try:
+                self._camera.exit()
+            except Exception:
+                pass
+        finally:
+            if acquired:
+                self._usb_lock.release()
+            self._connected = False
 
     def configure(self, **kwargs: Any) -> None:
         # noop -- configuration typically done via gp widgets in other functions
@@ -477,13 +604,8 @@ class SonyCamera(GPhotoCameraAdapter):
 
     def disconnect(self) -> None:
         """Disconnect; drain any queued camera events first."""
-        try:
-            context = gp.gp_context_new()
-            target = self._camera
-            _sony_drain_events(target, context)
-        except Exception:
-            logging.debug('SonyCamera.disconnect: event drain raised (non-fatal)')
-        # Stop background downloader if running
+        # Retire the downloader before taking the lock: it competes for the same one,
+        # so stopping it first is what makes the acquire below likely to succeed.
         try:
             if getattr(self, '_bg_downloader', None) is not None:
                 self._bg_downloader.stop()
@@ -491,11 +613,30 @@ class SonyCamera(GPhotoCameraAdapter):
                 self._bg_downloader = None
         except Exception:
             logging.debug('SonyCamera.disconnect: background downloader stop raised (non-fatal)')
+
+        # As in the base class: the drain and exit() are gphoto2 calls, so they run
+        # under the lock or not at all.
+        acquired = self._usb_lock.acquire(timeout=_DISCONNECT_LOCK_WAIT_S)
         try:
-            self._camera.exit()
-        except Exception:
-            pass
-        self._connected = False
+            if not acquired:
+                logging.warning(
+                    '%s: USB lock still held after %.1fs; skipping drain and exit() '
+                    'rather than racing a gphoto2 call in flight',
+                    self.name, _DISCONNECT_LOCK_WAIT_S,
+                )
+                return
+            try:
+                _sony_drain_events(self._camera, gp.gp_context_new())
+            except Exception:
+                logging.debug('SonyCamera.disconnect: event drain raised (non-fatal)')
+            try:
+                self._camera.exit()
+            except Exception:
+                pass
+        finally:
+            if acquired:
+                self._usb_lock.release()
+            self._connected = False
 
     def start_background_downloader(self) -> None:
         """Start a background downloader thread that fetches FILE_ADDED paths.
@@ -968,26 +1109,60 @@ class LiveViewThread(threading.Thread):
     lock_timeout : float
         Maximum seconds to wait for the USB lock before skipping a frame.
         Default 0.05 (50 ms).
+    start_paused : bool
+        Start suspended, so no frame is grabbed until ``resume()``.  Used when the
+        window is opened inside the filter-off window.
+    next_event_provider : callable[[], float | None] or None
+        Seconds until the next scheduled camera job, or None when nothing is
+        scheduled.  When supplied, the worker stands down as a shot approaches.
     """
 
-    def __init__(self, camera, frame_callback, interval_s: float = 1.0, lock_timeout: float = 0.05):
+    def __init__(self, camera, frame_callback, interval_s: float = 1.0, lock_timeout: float = 0.05,
+                 start_paused: bool = False, next_event_provider=None):
         super().__init__(daemon=True)
         self._camera = camera
         self._frame_callback = frame_callback
         self._interval_s = interval_s
         self._lock_timeout = lock_timeout
+        self._next_event_provider = next_event_provider
+        self._held_seconds: float | None = None
         self._stop_event = threading.Event()
         self._paused = threading.Event()
+        if start_paused:
+            # Opening the window inside the filter-off window must not grab even one
+            # frame: that frame is what engages live view on the body.
+            self._paused.set()
         self._probed = False
+        # True once the body may be in live view -- set on the first grab, since
+        # capture_preview engages live view whether or not the explicit write worked.
+        self._live_view_on = False
         self._zoom_request: Optional[int] = None
         self._zoom_level = 1
         self._zoom_error: Optional[str] = None
         self._base_dimensions: Optional[tuple] = None
         self._last_dimensions: Optional[tuple] = None
 
-    def stop(self):
-        """Signal the thread to stop and wait briefly for it to exit."""
+    def stop(self, timeout: float = _STOP_JOIN_WAIT_S) -> bool:
+        """Signal the thread to stop and wait for it to exit.  True when it did.
+
+        Joining matters: the worker leaves live view and resets zoom on its way out,
+        and libgphoto2 is not thread-safe, so a caller that tears the camera down
+        (``disconnect``) must not race a preview call still in flight.  The loop
+        waits on the stop event, so an idle worker returns immediately.
+
+        On timeout the worker is wedged inside libgphoto2.  Say so and leave it --
+        the thread is a daemon, and reaching into the library from this thread to
+        force the issue is exactly the race being avoided.
+        """
         self._stop_event.set()
+        self.join(timeout=timeout)
+        if self.is_alive():
+            logging.warning(
+                'LiveViewThread did not exit within %.1fs; the camera may still be '
+                'in live view and a gphoto2 call may still be in flight', timeout,
+            )
+            return False
+        return True
 
     def request_zoom(self, level: int) -> bool:
         """Ask the worker to change live-view zoom; applied under the USB lock.
@@ -1023,16 +1198,93 @@ class LiveViewThread(threading.Thread):
                 and self._last_dimensions != self._base_dimensions)
 
     def pause(self):
-        """Suspend preview capture without stopping the thread."""
+        """Suspend preview capture without stopping the thread.
+
+        The worker acts on this within one interval, dropping the mirror as it goes.
+        Pausing has to mean *out of live view*, not merely *not looking*: the reason
+        to pause is that the solar filter is about to come off.
+        """
         self._paused.set()
 
     def resume(self):
         """Resume suspended preview capture."""
         self._paused.clear()
 
+    def _settle_zoom_stream(self, target, context, expected) -> None:
+        """Pump previews until the frame size matches *expected*, or give up.
+
+        The 80D switches live-view streams lazily, on the next couple of preview
+        captures rather than on the config write (hardware-verified).  Without this
+        the body is still serving the old stream when the next thing happens.
+        """
+        if not expected:
+            return
+        for _ in range(5):
+            cam_file = gp.CameraFile()
+            gp.check_result(gp.gp_camera_capture_preview(target, cam_file, context))
+            frame = bytes(gp.check_result(gp.gp_file_get_data_and_size(cam_file)))
+            dimensions = _jpeg_dimensions(frame)
+            if dimensions:
+                self._last_dimensions = dimensions
+                if dimensions == expected:
+                    return
+
+    def _leave_live_view(self, target, context, timeout: float) -> bool:
+        """Reset zoom and drop out of live view.  True when it completed.
+
+        Takes the USB lock for *timeout* and gives up rather than queueing if a shot
+        holds it -- a preview thread must never delay a scheduled capture.  A give-up
+        is not final: the caller retries on the next tick.
+        """
+        acquired = False
+        try:
+            acquired = self._camera._usb_lock.acquire(timeout=timeout)
+            if not acquired:
+                logging.debug('LiveViewThread: USB lock busy, deferring live-view exit')
+                return False
+
+            # Zoom first.  Leaving a Canon magnified across a live-view exit strands it
+            # there until a power cycle, and the reset needs preview captures to land --
+            # which re-engage live view, so it cannot follow the viewfinder write.
+            if self._zoom_level != 1:
+                try:
+                    _set_live_view_zoom(target, context, 1)
+                    self._zoom_level = 1
+                    self._settle_zoom_stream(target, context, self._base_dimensions)
+                except Exception as exc:
+                    logging.debug('LiveViewThread: zoom reset failed: %s', exc)
+
+            set_live_view(self._camera, False, context)
+            self._live_view_on = False
+            return True
+        except Exception:
+            logging.exception('LiveViewThread: live-view exit failed')
+            return False
+        finally:
+            if acquired:
+                try:
+                    self._camera._usb_lock.release()
+                except Exception:
+                    pass
+
     @property
     def is_paused(self) -> bool:
         return self._paused.is_set()
+
+    @property
+    def held_seconds(self) -> float | None:
+        """Seconds until the shot the worker is standing down for, or None."""
+        return self._held_seconds
+
+    def _seconds_to_next_job(self) -> float | None:
+        """Ask the provider how close the next camera job is.  Never raises."""
+        if self._next_event_provider is None:
+            return None
+        try:
+            return self._next_event_provider()
+        except Exception:
+            logging.exception('LiveViewThread: next-event provider raised')
+            return None
 
     def run(self):
         # If the camera provides a capture_preview() method (e.g. VirtualCamera
@@ -1047,9 +1299,31 @@ class LiveViewThread(threading.Thread):
             target = self._camera._camera if hasattr(self._camera, '_camera') else self._camera
             context = gp.gp_context_new()
 
+        try:
+            self._grab_loop(_has_virtual_preview, target, context)
+        finally:
+            # Whatever ended the loop -- stop, or a bug -- the mirror comes down.
+            if not _has_virtual_preview and self._live_view_on:
+                self._leave_live_view(target, context, _LIVE_VIEW_EXIT_WAIT_S)
+
+    def _grab_loop(self, _has_virtual_preview, target, context):
         while not self._stop_event.wait(self._interval_s):
             if self._paused.is_set():
+                # Paused means out of live view, so retry until the exit lands.
+                if not _has_virtual_preview and self._live_view_on:
+                    self._leave_live_view(target, context, self._lock_timeout)
                 continue
+
+            # Stand down as a scheduled shot approaches.  Grabs stop first; the mirror
+            # comes down closer in, so any in-flight grab has finished by then and the
+            # shot finds the body already in its normal state.
+            t_next = self._seconds_to_next_job()
+            if t_next is not None and t_next < LV_GUARD_S:
+                self._held_seconds = t_next
+                if not _has_virtual_preview and self._live_view_on and t_next < LV_EXIT_LEAD_S:
+                    self._leave_live_view(target, context, self._lock_timeout)
+                continue
+            self._held_seconds = None
 
             if _has_virtual_preview:
                 try:
@@ -1070,6 +1344,12 @@ class LiveViewThread(threading.Thread):
                 if not acquired:
                     logging.debug('LiveViewThread: USB lock busy, skipping frame')
                     continue
+
+                if not self._live_view_on:
+                    # Enter explicitly so entry and exit are symmetric and both get
+                    # logged; capture_preview would otherwise enter it as a side effect.
+                    set_live_view(self._camera, True, context)
+                    self._live_view_on = True
 
                 if self._zoom_request is not None:
                     request = self._zoom_request
@@ -1099,32 +1379,6 @@ class LiveViewThread(threading.Thread):
                 logging.debug('LiveViewThread: preview capture failed: %s', exc)
             except Exception:
                 logging.exception('LiveViewThread: unexpected error')
-            finally:
-                if acquired:
-                    try:
-                        self._camera._usb_lock.release()
-                    except Exception:
-                        pass
-
-        # Leave the camera unzoomed so the next live-view session (or the naked-eye
-        # framing on the body's screen) starts from the full view.
-        if not _has_virtual_preview and self._zoom_level != 1:
-            acquired = False
-            try:
-                acquired = self._camera._usb_lock.acquire(timeout=1.0)
-                if acquired:
-                    _set_live_view_zoom(target, context, 1)
-                    # The 80D switches streams lazily, on the next couple of preview
-                    # captures — without these the body stays zoomed after the write
-                    # (hardware-verified).
-                    for _ in range(5):
-                        cam_file = gp.CameraFile()
-                        gp.check_result(gp.gp_camera_capture_preview(target, cam_file, context))
-                        frame = bytes(gp.check_result(gp.gp_file_get_data_and_size(cam_file)))
-                        if self._base_dimensions and _jpeg_dimensions(frame) == self._base_dimensions:
-                            break
-            except Exception as exc:
-                logging.debug('LiveViewThread: zoom reset on stop failed: %s', exc)
             finally:
                 if acquired:
                     try:
@@ -1230,8 +1484,9 @@ def take_picture(camera: Camera, camera_settings: CameraSettings) -> None:
     # causes the camera to use its physical-dial settings, ignoring USB-set
     # values — so it must not be used for take_picture.
     # On EOS R-series mirrorless bodies trigger_capture incurs a live-view
-    # exit+re-entry overhead (~1-2 s).  This is handled by increasing
-    # misfire_grace_time in the APScheduler so queued shots are not dropped.
+    # exit+re-entry overhead (~1-2 s).  Nothing raises APScheduler's grace time to
+    # absorb that; what keeps it off the schedule is LiveViewThread standing down as
+    # a shot approaches (LV_GUARD_S), so the body is already out of live view.
     try:
         gp.check_result(gp.gp_camera_trigger_capture(target, context))
         logging.debug('take_picture: trigger_capture fired')
