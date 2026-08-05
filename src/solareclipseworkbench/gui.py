@@ -25,9 +25,10 @@ import numpy as np
 import pandas as pd
 import pytz
 from PyQt6.QtCore import QTimer, QRect, Qt, QAbstractTableModel, QModelIndex, QSettings, pyqtSignal, QObject
-from PyQt6.QtGui import QIcon, QAction, QIntValidator, QCloseEvent, QPixmap, QImage, QPainter, QPen, QColor, QBrush
+from PyQt6.QtGui import QIcon, QAction, QIntValidator, QCloseEvent, QPixmap, QImage, QPen, QColor, QBrush
 from PyQt6.QtWidgets import QMainWindow, QApplication, QWidget, QFrame, QLabel, QHBoxLayout, QVBoxLayout, QGridLayout, \
-    QGroupBox, QComboBox, QPushButton, QLineEdit, QFileDialog, QScrollArea, QTableView, QMessageBox, QCheckBox
+    QGroupBox, QComboBox, QPushButton, QLineEdit, QFileDialog, QScrollArea, QTableView, QMessageBox, QCheckBox, \
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 from PyQt6 import QtWidgets
 from apscheduler.job import Job
 from apscheduler.schedulers import SchedulerNotRunningError
@@ -2291,6 +2292,120 @@ def live_view_locked_out(now_utc, c2_info, c3_info) -> bool:
         (c3_info.time_utc + LIVE_VIEW_LOCKOUT_TRAIL)
 
 
+class PreviewView(QGraphicsView):
+    """Pan/zoom viewer for live-view frames.
+
+    Replaces scaling the pixmap down to fit a label, which threw away most of the
+    frame: at 5x the stream is a 1:1 crop of the sensor, so every discarded pixel was
+    a pixel the sensor actually resolved.  Judging focus needs those pixels on screen
+    at 1:1 or larger, not a smooth reduction of them.
+
+    The view transform survives frame replacement, so the operator can sit at 400% on
+    a limb while frames stream underneath at 10 fps.
+    """
+
+    # Below 1:1 the image is being reduced and smoothing genuinely looks better; at or
+    # above it, smoothing invents detail that is not in the data and makes a defocused
+    # limb look acceptable.  This is a focus tool, so show the pixels.
+    _SMOOTH_BELOW = 1.0
+    _MIN_SCALE = 0.05
+    _MAX_SCALE = 16.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._item = QGraphicsPixmapItem()
+        self._scene.addItem(self._item)
+
+        self._crosshair: list = []
+        self._frame_size = None
+        self._fit_mode = True
+
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setBackgroundBrush(QBrush(QColor(20, 20, 20)))
+        self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+
+    # -- frames ---------------------------------------------------------
+
+    def set_frame(self, pixmap: QPixmap) -> None:
+        """Show a new frame, keeping the current zoom and pan."""
+        size = (pixmap.width(), pixmap.height())
+        self._item.setPixmap(pixmap)
+
+        if size != self._frame_size:
+            # A new frame size means the zoom level changed on the camera, so the old
+            # scene rect and crosshair no longer describe the image.
+            self._frame_size = size
+            self._scene.setSceneRect(0, 0, size[0], size[1])
+            self._rebuild_crosshair()
+            if self._fit_mode:
+                self.fit()
+
+        self._apply_transformation_mode()
+
+    def _rebuild_crosshair(self) -> None:
+        for line in self._crosshair:
+            self._scene.removeItem(line)
+        self._crosshair = []
+        if not self._frame_size:
+            return
+
+        width, height = self._frame_size
+        pen = QPen(QColor(0, 120, 255))
+        # Zero width keeps the line one pixel wide on screen at any zoom, so the
+        # reticle never grows into the detail it is meant to sit beside.
+        pen.setWidth(0)
+        for x1, y1, x2, y2 in ((0, height / 2, width, height / 2),
+                               (width / 2, 0, width / 2, height)):
+            self._crosshair.append(self._scene.addLine(x1, y1, x2, y2, pen))
+
+    # -- zoom -----------------------------------------------------------
+
+    def current_scale(self) -> float:
+        return self.transform().m11()
+
+    def _apply_transformation_mode(self) -> None:
+        smooth = self.current_scale() < self._SMOOTH_BELOW
+        self._item.setTransformationMode(
+            Qt.TransformationMode.SmoothTransformation if smooth
+            else Qt.TransformationMode.FastTransformation)
+
+    def fit(self) -> None:
+        self._fit_mode = True
+        if self._frame_size:
+            self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+        self._apply_transformation_mode()
+
+    def set_scale(self, factor: float) -> None:
+        self._fit_mode = False
+        factor = max(self._MIN_SCALE, min(self._MAX_SCALE, factor))
+        self.resetTransform()
+        self.scale(factor, factor)
+        self._apply_transformation_mode()
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if not delta:
+            return
+        step = 1.25 if delta > 0 else 1 / 1.25
+        target = self.current_scale() * step
+        if not (self._MIN_SCALE <= target <= self._MAX_SCALE):
+            return
+        self._fit_mode = False
+        self.scale(step, step)
+        self._apply_transformation_mode()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Only Fit tracks the window; an explicit zoom is the operator's choice and
+        # must not be silently undone by a resize.
+        if self._fit_mode:
+            self.fit()
+
+
 class LiveViewWindow(QWidget):
     """Floating window that shows a live-view preview from a gphoto2 camera.
 
@@ -2326,9 +2441,23 @@ class LiveViewWindow(QWidget):
         self.setWindowTitle(f"Live View — {camera.name}")
 
         # Image display
-        self._image_label = QLabel("Waiting for first preview frame…")
-        self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._image_label.setMinimumSize(320, 240)
+        self._view = PreviewView()
+        self._view.setMinimumSize(320, 240)
+
+        self._waiting_label = QLabel("Waiting for first preview frame…")
+        self._waiting_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._waiting_label.setStyleSheet("color: gray;")
+
+        # View scale controls
+        self._scale_buttons = QHBoxLayout()
+        for label, action in (("Fit", self._view.fit),
+                              ("1:1", lambda: self._view.set_scale(1.0)),
+                              ("200%", lambda: self._view.set_scale(2.0)),
+                              ("400%", lambda: self._view.set_scale(4.0))):
+            button = QPushButton(label)
+            button.setToolTip("Wheel to zoom, drag to pan")
+            button.clicked.connect(action)
+            self._scale_buttons.addWidget(button)
 
         # Timestamp of last received frame
         self._timestamp_label = QLabel()
@@ -2358,11 +2487,14 @@ class LiveViewWindow(QWidget):
         btn_layout.addWidget(close_btn)
 
         layout = QVBoxLayout()
-        layout.addWidget(self._image_label, stretch=1)
+        layout.addWidget(self._waiting_label)
+        layout.addWidget(self._view, stretch=1)
+        layout.addLayout(self._scale_buttons)
         layout.addWidget(self._timestamp_label)
         layout.addWidget(self._status_label)
         layout.addLayout(btn_layout)
         self.setLayout(layout)
+        self._view.setVisible(False)
 
         # Drain the frame queue on the GUI thread, faster than frames arrive
         self._poll_timer = QTimer(self)
@@ -2425,22 +2557,10 @@ class LiveViewWindow(QWidget):
         image = QImage.fromData(jpeg_bytes)
         if image.isNull():
             return
-        pixmap = QPixmap.fromImage(image)
-        scaled = pixmap.scaled(
-            self._image_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        # Draw blue crosshair at the centre of the scaled pixmap
-        w, h = scaled.width(), scaled.height()
-        painter = QPainter(scaled)
-        pen = QPen(QColor(0, 120, 255))
-        pen.setWidth(1)
-        painter.setPen(pen)
-        painter.drawLine(0, h // 2, w, h // 2)  # horizontal
-        painter.drawLine(w // 2, 0, w // 2, h)  # vertical
-        painter.end()
-        self._image_label.setPixmap(scaled)
+        self._view.set_frame(QPixmap.fromImage(image))
+        if not self._view.isVisible():
+            self._view.setVisible(True)
+            self._waiting_label.setVisible(False)
         self._timestamp_label.setText("Last frame: " + ts.strftime("%Y-%m-%d  %H:%M:%S"))
         # Zoom state only shows up in frame dimensions, so refresh with each frame.
         thread = self._thread
