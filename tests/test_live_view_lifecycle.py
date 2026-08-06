@@ -144,6 +144,43 @@ def test_a_busy_usb_lock_defers_the_exit_instead_of_queueing_behind_a_shot():
     assert camera._usb_lock.denied == 1
 
 
+def test_a_caller_can_wait_for_the_mirror_to_actually_come_down():
+    """pause() only asks; the worker acts on its next tick.  A still capture that
+    shoots before then drags the body out of live view itself."""
+    camera = _FakeCamera()
+    got_frame = threading.Event()
+    frame = b"\xff\xd8\xff\xc0\x00\x11\x08\x01\xe0\x02\x80\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01"
+
+    with (patch("solareclipseworkbench.camera.gp.gp_context_new", return_value=object()),
+          patch("solareclipseworkbench.camera.gp.CameraFile", return_value=object()),
+          patch("solareclipseworkbench.camera.gp.gp_camera_capture_preview", return_value=0),
+          patch("solareclipseworkbench.camera.gp.gp_file_get_data_and_size", return_value=frame),
+          patch("solareclipseworkbench.camera.gp.check_result", side_effect=lambda x: x),
+          patch("solareclipseworkbench.camera.log_live_view_capabilities"),
+          patch("solareclipseworkbench.camera.set_live_view", return_value=True)):
+
+        thread = LiveViewThread(camera=camera, frame_callback=lambda _: got_frame.set(),
+                                interval_s=0.01, lock_timeout=0.05)
+        thread.start()
+        try:
+            assert got_frame.wait(1.0)
+            # Live view is engaged, so the wait must not report the mirror down.
+            assert thread.wait_for_live_view_off(0.0) is False
+
+            thread.pause()
+
+            assert thread.wait_for_live_view_off(2.0) is True
+        finally:
+            thread.stop(timeout=2.0)
+
+
+def test_the_mirror_reads_as_down_before_any_frame_is_grabbed():
+    camera = _FakeCamera()
+    thread = LiveViewThread(camera=camera, frame_callback=lambda _: None)
+
+    assert thread.wait_for_live_view_off(0.0) is True
+
+
 def test_disconnect_skips_exit_rather_than_racing_a_call_in_flight():
     camera = GPhotoCameraAdapter.__new__(GPhotoCameraAdapter)
     camera.name = "Canon EOS 80D"

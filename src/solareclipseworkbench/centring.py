@@ -325,6 +325,65 @@ def offset_from_centre(fit: DiscFit, frame_size, preview_width: int):
     return dx, dy, dx * arcmin, dy * arcmin, norm <= 1.0
 
 
+def limb_target(fit: DiscFit, data: np.ndarray) -> tuple[float, float]:
+    """A point on the sunlit limb worth magnifying, in preview pixels.
+
+    Focus is judged on a limb, so the magnified view has to land on one.  Once the
+    partial phase starts, half the disc's edge is the moon rather than the sun, and
+    magnifying there gives a dark edge that reads as hopeless focus at any setting.
+
+    The moon's direction is read off the frame: it covers one side, so the centroid of
+    the lit area is pushed away from it, and the moon lies opposite. Aiming ninety
+    degrees away from that keeps the target on sunlit limb for the whole partial phase,
+    including a thin crescent where the two ends of the arc are all that is left.
+    """
+    cx, cy = fit.centre
+    mask = data >= 0.5 * float(data.max())
+    ys, xs = np.nonzero(mask)
+    if xs.size == 0:
+        return cx + fit.radius, cy
+
+    to_moon = np.array([cx - float(xs.mean()), cy - float(ys.mean())])
+    if np.hypot(*to_moon) < 0.05 * fit.radius:
+        # No detectable bite, so any limb point will do.  Left, arbitrarily but
+        # predictably -- an operator who knows where it goes can plan around it.
+        return cx - fit.radius, cy
+
+    to_moon /= np.hypot(*to_moon)
+    height, width = data.shape
+    # Both perpendiculars are equally sunlit; take whichever sits further inside the
+    # frame, since a target near an edge leaves the magnified box hanging off it.
+    candidates = [
+        (cx - to_moon[1] * fit.radius, cy + to_moon[0] * fit.radius),
+        (cx + to_moon[1] * fit.radius, cy - to_moon[0] * fit.radius),
+    ]
+    return max(candidates,
+               key=lambda p: min(p[0], width - p[0], p[1], height - p[1]))
+
+
+def zoom_rect_position(target_preview, preview_width: int, zoom: int):
+    """Where to put the magnification box so *target_preview* is in its middle.
+
+    Returned in sensor coordinates, which is what eoszoomposition works in -- not
+    preview coordinates, a difference of about 6x at 1x.  Feeding it preview values
+    addresses only the top-left corner of the sensor.
+
+    The camera snaps the position to whatever step it supports, so this only has to be
+    close.  Clamped so the box stays on the sensor; an off-sensor request is the kind
+    of out-of-range value that has dropped this body off USB before.
+    """
+    scale = sensor_px_per_preview_px(preview_width)
+    centre_x = target_preview[0] * scale
+    centre_y = target_preview[1] * scale
+
+    rect_w = SENSOR_WIDTH_PX / zoom
+    rect_h = SENSOR_HEIGHT_PX / zoom
+    x = centre_x - rect_w / 2.0
+    y = centre_y - rect_h / 2.0
+    return (int(round(min(max(x, 0.0), SENSOR_WIDTH_PX - rect_w))),
+            int(round(min(max(y, 0.0), SENSOR_HEIGHT_PX - rect_h))))
+
+
 def tolerance_preview_px(preview_width: int):
     """Tolerance ellipse semi-axes in preview pixels, for drawing.
 

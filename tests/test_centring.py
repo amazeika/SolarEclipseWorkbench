@@ -11,6 +11,8 @@ import pytest
 
 from solareclipseworkbench.centring import (
     SkyOrientation,
+    limb_target,
+    zoom_rect_position,
     calibrate_from_untracked_drift,
     ARCSEC_PER_SENSOR_PX,
     DriftTracker,
@@ -254,6 +256,59 @@ def test_calibration_survives_a_bearing_given_outside_one_turn():
     orientation = calibrate_from_untracked_drift(image_bearing=450.0)
 
     assert orientation.west_image_bearing == pytest.approx(90.0)
+
+
+def test_the_limb_target_avoids_the_moon():
+    """Magnifying the lunar edge shows a dark rim that reads as hopeless focus at
+    every setting, so the target has to stay on sunlit limb."""
+    image = disc(moon_offset=(90.0, 0.0))   # moon encroaching from the right
+    fit = fit_solar_disc(image)
+
+    tx, ty = limb_target(fit, image)
+
+    assert abs(tx - 240) < fit.radius * 0.4, "target drifted toward the moon"
+    assert abs(ty - 240) == pytest.approx(fit.radius, rel=0.15)
+
+
+def test_the_limb_target_sits_on_the_limb():
+    image = disc()
+    fit = fit_solar_disc(image)
+
+    tx, ty = limb_target(fit, image)
+
+    assert np.hypot(tx - 240, ty - 240) == pytest.approx(fit.radius, rel=0.02)
+
+
+@pytest.mark.parametrize("moon_at", [(90.0, 0.0), (-90.0, 0.0), (0.0, 90.0), (0.0, -90.0)])
+def test_the_target_stays_sunlit_whichever_side_the_moon_is_on(moon_at):
+    image = disc(moon_offset=moon_at)
+    fit = fit_solar_disc(image)
+
+    tx, ty = limb_target(fit, image)
+
+    # Just inside the limb at the target should still be lit.
+    inward = (240 + (tx - 240) * 0.9, 240 + (ty - 240) * 0.9)
+    assert image[int(inward[1]), int(inward[0])] > 0.4 * image.max()
+
+
+def test_the_zoom_box_is_positioned_in_sensor_coordinates():
+    """eoszoomposition works in sensor pixels; preview values would address only the
+    top-left corner of the sensor."""
+    x, y = zoom_rect_position((480.0, 320.0), preview_width=960, zoom=5)
+
+    # Frame centre in preview px is sensor centre; the 5x box is 1200x800 sensor px.
+    assert x == pytest.approx(SENSOR_WIDTH_PX / 2 - 600, abs=2)
+    assert y == pytest.approx(4000 / 2 - 400, abs=2)
+
+
+def test_the_zoom_box_is_kept_on_the_sensor():
+    """An out-of-range value is the kind of write that has dropped this body off USB."""
+    x, y = zoom_rect_position((0.0, 0.0), preview_width=960, zoom=5)
+    assert (x, y) == (0, 0)
+
+    x, y = zoom_rect_position((960.0, 640.0), preview_width=960, zoom=5)
+    assert x == SENSOR_WIDTH_PX - 1200
+    assert y == 4000 - 800
 
 
 def test_drift_ignores_samples_that_left_the_window():

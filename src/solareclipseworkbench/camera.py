@@ -1,3 +1,4 @@
+import contextlib
 import functools
 import locale
 import logging
@@ -208,6 +209,21 @@ def _set_live_view_zoom(target, context, level: int) -> None:
     _drain_camera_events(target, context, timeout_ms=500)
 
 
+def _set_live_view_zoom_position(target, context, x: int, y: int) -> None:
+    """Move the magnification box.  Caller holds the USB lock.
+
+    Coordinates are sensor pixels, not preview pixels -- roughly a six-fold difference
+    on this body, and passing preview values would address only the top-left corner of
+    the sensor.  Written after the zoom level, which is the order the camera expects:
+    the position is ignored while the body is still switching magnification.
+    """
+    config = gp.check_result(gp.gp_camera_get_config(target, context))
+    widget = gp.check_result(gp.gp_widget_get_child_by_name(config, 'eoszoomposition'))
+    gp.gp_widget_set_value(widget, f'{int(x)},{int(y)}')
+    gp.gp_camera_set_config(target, config, context)
+    _drain_camera_events(target, context, timeout_ms=500)
+
+
 def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
     """Return (width, height) of a JPEG, or None when the markers cannot be read.
 
@@ -241,6 +257,42 @@ def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
             return None
         offset += 2 + segment_length
     return None
+
+
+def _largest_embedded_jpeg(data: bytes) -> bytes | None:
+    """Biggest JPEG inside a raw file, by pixel count.
+
+    A CR2 carries several: a 160x120 thumbnail, a small uncompressed preview, and a
+    large JPEG rendering of the frame.  gphoto2's PREVIEW file type hands over the
+    thumbnail, which is useless for judging focus, so the large one is dug out of the
+    file instead.  That is a marker scan rather than a raw decode -- no new dependency,
+    and it does not care which raw format it is looking at.
+    """
+    best = None
+    best_area = 0
+    offset = 0
+    while True:
+        start = data.find(b'\xff\xd8\xff', offset)
+        if start < 0:
+            break
+        offset = start + 2
+        # The frame header is near the front, so a slice is enough to size it.
+        dimensions = _jpeg_dimensions(data[start:start + 65536])
+        if not dimensions:
+            continue
+        width, height = dimensions
+        # Raw sensor data contains this marker sequence by chance, and a stray hit can
+        # parse as an absurd size.  Bound it to something a camera could have written,
+        # above the thumbnail sizes that are no use for judging focus anyway.
+        if not (320 <= width <= 20000 and 240 <= height <= 20000):
+            continue
+        area = width * height
+        if area <= best_area:
+            continue
+        end = data.find(b'\xff\xd9', start)
+        best = data[start:end + 2] if end > start else data[start:]
+        best_area = area
+    return best
 
 
 def _describe_widget(target, name, context) -> str | None:
@@ -1136,7 +1188,12 @@ class LiveViewThread(threading.Thread):
         # True once the body may be in live view -- set on the first grab, since
         # capture_preview engages live view whether or not the explicit write worked.
         self._live_view_on = False
+        # Set whenever the mirror is known to be down, so a caller that needs the
+        # camera in its normal state can wait for it rather than assume.
+        self._live_view_off = threading.Event()
+        self._live_view_off.set()
         self._zoom_request: Optional[int] = None
+        self._zoom_position_request = None
         self._zoom_level = 1
         self._zoom_error: Optional[str] = None
         self._base_dimensions: Optional[tuple] = None
@@ -1164,8 +1221,13 @@ class LiveViewThread(threading.Thread):
             return False
         return True
 
-    def request_zoom(self, level: int) -> bool:
+    def request_zoom(self, level: int, position=None) -> bool:
         """Ask the worker to change live-view zoom; applied under the USB lock.
+
+        *position* is an (x, y) in **sensor** pixels for the magnification box, applied
+        after the zoom in the same locked step so the two cannot be separated by a
+        frame grab -- the camera ignores a position written while it is still changing
+        magnification.
 
         Returns False without requesting anything when *level* is outside
         LIVE_VIEW_ZOOM_LEVELS.
@@ -1173,6 +1235,7 @@ class LiveViewThread(threading.Thread):
         if level not in LIVE_VIEW_ZOOM_LEVELS:
             return False
         self._zoom_error = None
+        self._zoom_position_request = position
         self._zoom_request = level
         return True
 
@@ -1256,6 +1319,7 @@ class LiveViewThread(threading.Thread):
 
             set_live_view(self._camera, False, context)
             self._live_view_on = False
+            self._live_view_off.set()
             return True
         except Exception:
             logging.exception('LiveViewThread: live-view exit failed')
@@ -1270,6 +1334,18 @@ class LiveViewThread(threading.Thread):
     @property
     def is_paused(self) -> bool:
         return self._paused.is_set()
+
+    def wait_for_live_view_off(self, timeout: float) -> bool:
+        """Block until the mirror is down, or *timeout* passes.  True if it is down.
+
+        ``pause()`` only asks; the worker acts on its next tick.  Anything that needs
+        the camera in its normal state -- a still capture, most obviously -- has to
+        wait for that to actually happen, or it fires mid-live-view and pays the mode
+        transition this design exists to avoid.
+
+        Never call this from the GUI thread: it waits on the preview loop.
+        """
+        return self._live_view_off.wait(timeout)
 
     @property
     def held_seconds(self) -> float | None:
@@ -1348,16 +1424,24 @@ class LiveViewThread(threading.Thread):
                 if not self._live_view_on:
                     # Enter explicitly so entry and exit are symmetric and both get
                     # logged; capture_preview would otherwise enter it as a side effect.
+                    self._live_view_off.clear()
                     set_live_view(self._camera, True, context)
                     self._live_view_on = True
 
                 if self._zoom_request is not None:
                     request = self._zoom_request
+                    position = self._zoom_position_request
                     self._zoom_request = None
+                    self._zoom_position_request = None
                     try:
                         _set_live_view_zoom(target, context, request)
                         self._zoom_level = request
-                        logging.info('LiveViewThread: zoom set to %d×', request)
+                        if position is not None and request != 1:
+                            _set_live_view_zoom_position(target, context, *position)
+                            logging.info('LiveViewThread: zoom set to %d× at sensor %s',
+                                         request, position)
+                        else:
+                            logging.info('LiveViewThread: zoom set to %d×', request)
                     except Exception as exc:
                         self._zoom_error = str(exc)
                         logging.warning('LiveViewThread: zoom write failed: %s', exc)
@@ -1385,6 +1469,242 @@ class LiveViewThread(threading.Thread):
                         self._camera._usb_lock.release()
                     except Exception:
                         pass
+
+
+class ReviewShot:
+    """One frame taken to check settings, held in memory rather than kept."""
+
+    def __init__(self, jpeg: bytes | None = None, name: str = "", reason: str = "",
+                 embedded_preview: bool = False):
+        self.jpeg = jpeg
+        self.name = name
+        self.reason = reason
+        #: True when this came out of a raw file rather than being the capture itself,
+        #: which the operator should know before judging fine detail on it.
+        self.embedded_preview = embedded_preview
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.jpeg)
+
+
+#: Lock budget for the setup-only camera calls below.  Generous compared to a
+#: scheduled shot's, because these are operator-driven and waiting is preferable to
+#: failing -- but still bounded, so they can never sit in front of a scheduled shot.
+_SETUP_LOCK_WAIT_S: float = 5.0
+
+
+@contextlib.contextmanager
+def _setup_access(camera, what: str):
+    """Serialise a setup-only camera call, without reporting it as a shot.
+
+    These calls are not part of the sequence, so they must not publish ShotEvents:
+    a failed exposure check is not a missed eclipse frame, and counting it as one
+    puts a number on the missed-shots indicator that means nothing and hides the
+    ones that matter.
+    """
+    acquired = camera._usb_lock.acquire(timeout=_SETUP_LOCK_WAIT_S)
+    if not acquired:
+        raise CameraError(f"{what}: the camera was busy for more than "
+                          f"{_SETUP_LOCK_WAIT_S:.0f}s")
+    try:
+        yield
+    finally:
+        camera._usb_lock.release()
+
+
+def apply_exposure(camera: Camera, camera_settings: CameraSettings) -> None:
+    """Program shutter, aperture and ISO without taking a picture.
+
+    Live view on this body simulates the exposure it is set to, so writing the settings
+    makes the preview show roughly what a capture would look like.  That turns choosing
+    an exposure into something the operator can see immediately, instead of a
+    shutter-and-download round trip per guess.
+    """
+    with _setup_access(camera, 'apply_exposure'):
+        __adapt_camera_settings(camera, camera_settings)
+
+
+def read_exposure_choices(camera) -> dict:
+    """The shutter, aperture and ISO values this camera will actually accept.
+
+    Asked rather than assumed, because the answer is not fixed: the aperture list comes
+    from whatever lens is attached, and a telescope offers none at all.  A hardcoded
+    list is wrong the moment the gear changes, and wrong in the quiet way -- the write
+    is refused or ignored at the camera rather than reported here.
+
+    Returns a dict of name -> list of strings; missing widgets are simply absent.
+    """
+    choices = {}
+    try:
+        target = camera._camera if hasattr(camera, '_camera') else camera
+        context = gp.gp_context_new()
+        config = gp.check_result(gp.gp_camera_get_config(target, context))
+    except Exception as exc:
+        logging.debug('Could not read the exposure choice lists: %s', exc)
+        return choices
+
+    for name in ('shutterspeed', 'aperture', 'iso'):
+        try:
+            widget = gp.check_result(gp.gp_widget_get_child_by_name(config, name))
+            count = gp.check_result(gp.gp_widget_count_choices(widget))
+            values = [str(gp.check_result(gp.gp_widget_get_choice(widget, index)))
+                      for index in range(count)]
+            # 'Auto' defeats the point of checking a specific exposure.
+            values = [v for v in values if v and not v.lower().startswith('auto')]
+            if values:
+                choices[name] = values
+        except Exception:
+            logging.debug('%s: no %s choices reported',
+                          getattr(camera, 'name', '?'), name)
+    return choices
+
+
+def read_exposure_settings(camera) -> CameraSettings | None:
+    """Current shutter, aperture and ISO as the camera reports them.
+
+    Used to put things back after a review capture.  Live view on this body simulates
+    the exposure it is set to, so leaving a solar shutter speed programmed turns the
+    preview black -- and the operator has no obvious way to connect the two.
+    """
+    try:
+        target = camera._camera if hasattr(camera, '_camera') else camera
+        context = gp.gp_context_new()
+        config = gp.check_result(gp.gp_camera_get_config(target, context))
+
+        def read(name):
+            widget = gp.check_result(gp.gp_widget_get_child_by_name(config, name))
+            return gp.check_result(gp.gp_widget_get_value(widget))
+
+        iso = read('iso')
+        return CameraSettings(
+            getattr(camera, 'name', ''),
+            str(read('shutterspeed')),
+            str(read('aperture')),
+            int(iso) if str(iso).isdigit() else 0,
+        )
+    except Exception as exc:
+        logging.debug('Could not read the current exposure settings: %s', exc)
+        return None
+
+
+def restore_exposure_settings(camera, settings: CameraSettings | None) -> None:
+    """Put back what read_exposure_settings saw.  Never raises.
+
+    Called when the live-view window closes: the exposure it programmed was for
+    previewing, and leaving the body on a solar shutter speed afterwards is a surprise
+    the operator has no obvious way to trace.
+    """
+    if settings is None:
+        return
+    try:
+        apply_exposure(camera, settings)
+        logging.debug('Restored exposure to %s, f/%s, ISO %s',
+                      settings.shutter_speed, settings.aperture, settings.iso)
+    except Exception:
+        logging.exception('Could not restore the previous exposure settings')
+
+
+def _wait_for_new_file(target, context, timeout_ms: int = 5000, max_events: int = 30):
+    """Wait for a capture to land and report where it went.
+
+    Same event loop as _wait_for_capture_complete, but it keeps the path instead of
+    discarding it, which is the only way to fetch the frame back off the camera.
+    """
+    path = None
+    for _ in range(max_events):
+        try:
+            event_type, data = gp.check_result(
+                gp.gp_camera_wait_for_event(target, timeout_ms, context))
+        except gphoto2.GPhoto2Error:
+            break
+        if event_type == gp.GP_EVENT_FILE_ADDED:
+            path = data
+            break
+        if event_type in (gp.GP_EVENT_CAPTURE_COMPLETE, gp.GP_EVENT_TIMEOUT):
+            # Some bodies report completion before the file appears; keep waiting
+            # briefly for the path rather than giving up on it.
+            continue
+    _drain_camera_events(target, context, timeout_ms=200, max_events=10)
+    return path
+
+
+def capture_for_review(camera: Camera, camera_settings: CameraSettings) -> ReviewShot:
+    """Take one frame with the given settings and hand back its JPEG.
+
+    For checking an exposure before it matters.  Live view simulates the exposure it is
+    set to, which gets an operator close, but only a real frame answers whether a given
+    shutter and ISO through a solar filter actually yield a usable disc -- and that is
+    not recoverable once the partial phase has started.
+
+    Serialised against the rest of the camera work, but deliberately not reported as a
+    shot: this is not part of the sequence, and a failed exposure check is not a missed
+    eclipse frame.
+
+    Returns a ReviewShot describing what happened; never raises.  The frame is handed
+    back rather than kept -- the copy on the card is the camera's business, and nothing
+    is written to disk here.
+    """
+    try:
+        with _setup_access(camera, 'capture_for_review'):
+            return _capture_for_review(camera, camera_settings)
+    except Exception as exc:
+        logging.exception('Review capture failed')
+        return ReviewShot(reason=str(exc))
+
+
+def _capture_for_review(camera, camera_settings) -> ReviewShot:
+    context, config = __adapt_camera_settings(camera, camera_settings)
+    if context is None:
+        return ReviewShot(reason="not supported on this camera")
+
+    target = camera._camera if hasattr(camera, '_camera') else camera
+    _drain_camera_events(target, context, timeout_ms=100, max_events=20)
+    gp.check_result(gp.gp_camera_trigger_capture(target, context))
+
+    path = _wait_for_new_file(target, context)
+    if path is None:
+        return ReviewShot(reason="the camera did not report a new file")
+
+    name = getattr(path, 'name', '') or ''
+    is_jpeg = name.lower().endswith(('.jpg', '.jpeg'))
+
+    # A raw file needs no decoder here: it carries a large JPEG rendering of the frame,
+    # so a body set to RAW-only can still be checked without changing how it shoots.
+    # The whole file is fetched for that -- tens of megabytes, and slow -- but PREVIEW
+    # returns only a 160x120 thumbnail, which says nothing about focus.  The thumbnail
+    # is kept as a last resort so a failed extraction still shows something.
+    attempts = ([(gp.GP_FILE_TYPE_NORMAL, False)] if is_jpeg
+                else [(gp.GP_FILE_TYPE_NORMAL, True), (gp.GP_FILE_TYPE_PREVIEW, True)])
+
+    last_error = None
+    for file_type, embedded in attempts:
+        try:
+            # camera_file is an out-parameter here, not a return value.
+            camera_file = gp.CameraFile()
+            gp.check_result(gp.gp_camera_file_get(
+                target, path.folder, name, file_type, camera_file, context))
+            data = bytes(gp.check_result(gp.gp_file_get_data_and_size(camera_file)))
+        except Exception as exc:
+            last_error = exc
+            continue
+
+        if data[:2] == b'\xff\xd8':
+            return ReviewShot(jpeg=data, name=name, embedded_preview=embedded)
+
+        extracted = _largest_embedded_jpeg(data)
+        if extracted:
+            dimensions = _jpeg_dimensions(extracted)
+            logging.info('Extracted a %s JPEG from %s',
+                         f'{dimensions[0]}x{dimensions[1]}' if dimensions else '?', name)
+            return ReviewShot(jpeg=extracted, name=name, embedded_preview=True)
+
+        last_error = 'no JPEG found inside the file'
+
+    return ReviewShot(
+        name=name,
+        reason=(f"could not get a viewable image out of {name}"
+                + (f" ({last_error})" if last_error else "")))
 
 
 @_serialised_on_camera
