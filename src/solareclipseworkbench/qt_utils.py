@@ -18,7 +18,20 @@ import subprocess
 import sys
 from PyQt6.QtCore import QEvent, QObject
 from PyQt6.QtGui import QColor, QPalette
-from PyQt6.QtWidgets import QApplication, QLineEdit
+from PyQt6.QtWidgets import QApplication, QFileDialog, QLineEdit
+
+# Qt hands QFileDialog to the platform's own file browser by default.  On macOS
+# that panel is drawn out of process, and a process running as root cannot show
+# it at all: the call returns an empty selection immediately, without ever
+# displaying anything and without raising, so the app just looks like it ignored
+# the click.  Running as root is the documented way to launch on macOS (gphoto2
+# needs it to reach the cameras), so that is the normal case there, not an edge
+# case.  Qt's own dialog is drawn in-process and always appears.
+#
+# Every other dialog in this application -- QMessageBox, the wizard, and all the
+# pop-ups -- is already drawn by Qt, so this also makes the file dialog behave
+# and look the same as the rest of the app, and the same on every platform.
+FILE_DIALOG_OPTIONS = QFileDialog.Option.DontUseNativeDialog
 
 
 def _is_dark_mode_preferred() -> bool:

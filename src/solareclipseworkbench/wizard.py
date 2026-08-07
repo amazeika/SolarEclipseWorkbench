@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from solareclipseworkbench.location_ui import ConfigManager, GeocodingWorker, GEOPY_AVAILABLE, LocationWidget
-from solareclipseworkbench.qt_utils import apply_system_color_scheme, _is_dark_mode_preferred, _build_dark_palette, dark_lineedit_style, apply_dark_to_lineedit
+from solareclipseworkbench.qt_utils import apply_system_color_scheme, _is_dark_mode_preferred, _build_dark_palette, dark_lineedit_style, apply_dark_to_lineedit, FILE_DIALOG_OPTIONS
 
 # Import eclipse-specific modules
 from astropy.time import Time
@@ -1302,7 +1302,8 @@ class SummaryPage(QWizardPage):
             self,
             "Save Script File",
             str(Path.home()),
-            "Script Files (*.txt);;All Files (*)"
+            "Script Files (*.txt);;All Files (*)",
+            options=FILE_DIALOG_OPTIONS
         )
         if filename:
             self.save_path_edit.setText(filename)
