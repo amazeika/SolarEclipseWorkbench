@@ -55,7 +55,7 @@ from solareclipseworkbench.focus_metrics import (
 from solareclipseworkbench.observer import Observer, Observable
 from solareclipseworkbench.shot_events import BUS, ShotEvent, ShotOutcome
 from solareclipseworkbench import shot_log
-from solareclipseworkbench.qt_utils import apply_system_color_scheme
+from solareclipseworkbench.qt_utils import apply_system_color_scheme, FILE_DIALOG_OPTIONS
 from solareclipseworkbench.reference_moments import calculate_reference_moments, ReferenceMomentInfo
 from solareclipseworkbench.scripts import parse_location_from_script
 from solareclipseworkbench.location_ui import ConfigManager, LocationWidget
@@ -1235,7 +1235,8 @@ class SolarEclipseController(Observer):
 
         elif text == "File":
             filename, _ = QFileDialog.getOpenFileName(None, "QFileDialog.getOpenFileName()", "",
-                                                      "All Files (*);;Python Files (*.py);;Text Files (*.txt)")
+                                                      "All Files (*);;Python Files (*.py);;Text Files (*.txt)",
+                                                      options=FILE_DIALOG_OPTIONS)
 
             if not filename:
                 return  # user cancelled the dialog
