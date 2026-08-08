@@ -143,6 +143,8 @@ you can spot problems at a glance. See
 
 - [README](../README.md) — complete reference for every feature and command-line
   option.
+- [Eclipse Day Field Checklist](ECLIPSE_DAY.md) — what to do and check on site,
+  including when to focus and how to time the filter changes.
 - [Troubleshooting Guide](TROUBLESHOOTING.md) — what to do when something goes
   wrong, including recovering from a crash mid-eclipse.
 - [Configuration Wizard Guide](WIZARD_GUIDE.md) — building and tuning scripts.

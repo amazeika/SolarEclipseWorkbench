@@ -837,7 +837,8 @@ If something goes wrong, an error message will be logged in the log file
 `echo $TMPDIR`; on Linux, typically `/tmp`).
 
 For symptoms and fixes — including what to do if the application crashes during
-the eclipse — see the [Troubleshooting Guide](docs/TROUBLESHOOTING.md).
+the eclipse — see the [Troubleshooting Guide](docs/TROUBLESHOOTING.md). For the
+run itself, see the [Eclipse Day Field Checklist](docs/ECLIPSE_DAY.md).
 
 ## Development Guide
 

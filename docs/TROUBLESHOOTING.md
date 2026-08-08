@@ -4,7 +4,9 @@ Things that go wrong, and what to do about them. The first section is the one
 you want on eclipse day — the rest is ordered by when in the session a problem
 shows up.
 
-For the normal happy-path sequence, see the [Quick Start Guide](QUICK_START.md).
+For the normal happy-path sequence, see the [Quick Start Guide](QUICK_START.md);
+for what to do and check on site, see the
+[Eclipse Day Field Checklist](ECLIPSE_DAY.md).
 
 ## Contents
 
