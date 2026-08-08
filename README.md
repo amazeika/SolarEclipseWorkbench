@@ -836,6 +836,9 @@ If something goes wrong, an error message will be logged in the log file
 `solareclipseworkbench-<user>.log` in your system temporary directory (on macOS,
 `echo $TMPDIR`; on Linux, typically `/tmp`).
 
+For symptoms and fixes — including what to do if the application crashes during
+the eclipse — see the [Troubleshooting Guide](docs/TROUBLESHOOTING.md).
+
 ## Development Guide
 
 When you want to help with the development of Solar Eclipse Workbench, some extra installation is needed.

@@ -143,6 +143,8 @@ you can spot problems at a glance. See
 
 - [README](../README.md) — complete reference for every feature and command-line
   option.
+- [Troubleshooting Guide](TROUBLESHOOTING.md) — what to do when something goes
+  wrong, including recovering from a crash mid-eclipse.
 - [Configuration Wizard Guide](WIZARD_GUIDE.md) — building and tuning scripts.
 - [GPS from your phone](GPS_PHONE.md) — capturing precise coordinates in the
   field.
