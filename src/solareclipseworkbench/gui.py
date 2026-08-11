@@ -25,9 +25,10 @@ import numpy as np
 import pandas as pd
 import pytz
 from PyQt6.QtCore import QTimer, QRect, Qt, QAbstractTableModel, QModelIndex, QSettings, pyqtSignal, QObject
-from PyQt6.QtGui import QIcon, QAction, QIntValidator, QCloseEvent, QPixmap, QImage, QPainter, QPen, QColor, QBrush
+from PyQt6.QtGui import QIcon, QAction, QIntValidator, QCloseEvent, QPixmap, QImage, QPen, QColor, QBrush
 from PyQt6.QtWidgets import QMainWindow, QApplication, QWidget, QFrame, QLabel, QHBoxLayout, QVBoxLayout, QGridLayout, \
-    QGroupBox, QComboBox, QPushButton, QLineEdit, QFileDialog, QScrollArea, QTableView, QMessageBox
+    QGroupBox, QComboBox, QPushButton, QLineEdit, QFileDialog, QScrollArea, QTableView, QMessageBox, QCheckBox, \
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 from PyQt6 import QtWidgets
 from apscheduler.job import Job
 from apscheduler.schedulers import SchedulerNotRunningError
@@ -43,7 +44,14 @@ import threading
 
 from solareclipseworkbench.camera import get_camera_dict, get_battery_level, get_free_space, get_space, \
     get_shooting_mode, get_focus_mode, set_time, CameraSettings, LiveViewThread, \
-    sony_save_destination_needs_downloader
+    sony_save_destination_needs_downloader, LIVE_VIEW_ZOOM_LEVELS, VirtualCamera, \
+    ReviewShot, capture_for_review, apply_exposure, read_exposure_choices, \
+    read_exposure_settings, restore_exposure_settings
+from solareclipseworkbench.centring import (
+    DriftTracker, SkyOrientation, calibrate_from_untracked_drift, fit_solar_disc,
+    limb_target, offset_from_centre, tolerance_preview_px, zoom_rect_position)
+from solareclipseworkbench.focus_metrics import (
+    FocusTracker, RollingEnvelope, grade_edge_width, measure_limb_sharpness)
 from solareclipseworkbench.observer import Observer, Observable
 from solareclipseworkbench.shot_events import BUS, ShotEvent, ShotOutcome
 from solareclipseworkbench import shot_log
@@ -344,6 +352,7 @@ class SolarEclipseView(QMainWindow, Observable):
 
         self.date_format = list(DATE_FORMATS.keys())[0]
         self.time_format = list(TIME_FORMATS.keys())[0]
+        self.live_view_enabled = True
 
         self.toolbar = None
         self.location_action = QAction("Location", self)
@@ -529,6 +538,10 @@ class SolarEclipseView(QMainWindow, Observable):
 
         self.settings.setValue("date_format", self.date_format)
         self.settings.setValue("time_format", self.time_format)
+
+        # Live view
+
+        self.settings.setValue("live_view_enabled", self.live_view_enabled)
 
     def init_ui(self):
         """ Add all components to the UI. """
@@ -760,7 +773,8 @@ class SolarEclipseView(QMainWindow, Observable):
 
         # Live View
 
-        self.live_view_action.setStatusTip("Open live view window (1 fps preview from camera)")
+        self.live_view_action.setStatusTip(
+            "Open live view window (locked out while the solar filter is off)")
         self.live_view_action.setIcon(QIcon(str(ICON_PATH / "camera.png")))
         self.live_view_action.triggered.connect(self.on_toolbar_button_click)
         self.toolbar.addAction(self.live_view_action)
@@ -1029,18 +1043,11 @@ class SolarEclipseController(Observer):
         self.view.update_time(current_time_local, current_time_utc, countdown_c1, countdown_c2, countdown_max,
                               countdown_c3, countdown_c4, countdown_sunrise, countdown_sunset)
 
-        # Auto-pause live view 15 s before C2 until 15 s after C3 so scheduled
-        # shots around second and third contact have uncontested USB access.
+        # Lock live view out while the solar filter is off.  Same predicate the window
+        # consults when it opens, so the two cannot drift apart.
         if self._live_view_window is not None:
-            c2 = self.model.c2_info
-            c3 = self.model.c3_info
-            _MARGIN = datetime.timedelta(seconds=15)
-            in_totality = (
-                c2 is not None
-                and c3 is not None
-                and (c2.time_utc - _MARGIN) <= current_time_utc <= (c3.time_utc + _MARGIN)
-            )
-            self._live_view_window.set_totality_paused(in_totality)
+            self._live_view_window.set_locked_out(live_view_locked_out(
+                current_time_utc, self.model.c2_info, self.model.c3_info))
 
         # self.view.eclipse_visualization.plot(current_time_utc)    FIXME
 
@@ -1146,6 +1153,10 @@ class SolarEclipseController(Observer):
 
             time_format = changed_object.time_combobox.currentText()
             self.view.time_format = time_format
+
+            self.view.live_view_enabled = changed_object.live_view_checkbox.isChecked()
+            if not self.view.live_view_enabled and self._live_view_window is not None:
+                self._live_view_window.close()
 
             if self.model.c1_info:
                 self.view.c1_time_utc_label.setText(format_time(self.model.c1_info.time_utc, time_format))
@@ -1382,6 +1393,16 @@ class SolarEclipseController(Observer):
         is shown so the user can pick which one to preview.
         Shows a warning when no real camera is connected.
         """
+        # The operator kill switch is checked here rather than inside the window so
+        # that turning it off means the camera is not contacted at all.
+        if not self.view.live_view_enabled:
+            QMessageBox.information(
+                self.view, "Live view disabled",
+                "Live view is turned off in Settings → Datetime format.\n\n"
+                "Re-enable it there to open the preview window.",
+            )
+            return
+
         # If window already exists, bring it to the front
         if self._live_view_window is not None and self._live_view_window.isVisible():
             self._live_view_window.activateWindow()
@@ -1428,8 +1449,23 @@ class SolarEclipseController(Observer):
                 return
             camera = dict(real_cameras)[chosen]
 
-        self._live_view_window = LiveViewWindow(camera, parent=None)
+        # Decide the lockout here rather than waiting for the next 1 Hz tick: a window
+        # opened inside the filter-off span would otherwise grab a frame first, and
+        # that frame is what puts the mirror up.
+        locked_out = live_view_locked_out(
+            datetime.datetime.now(datetime.timezone.utc),
+            self.model.c2_info, self.model.c3_info)
+
+        self._live_view_window = LiveViewWindow(
+            camera, parent=None, locked_out=locked_out,
+            next_event_provider=lambda: seconds_to_next_camera_job(self.scheduler),
+        )
+        self._live_view_window.closed.connect(self._on_live_view_closed)
         self._live_view_window.show()
+
+    def _on_live_view_closed(self):
+        """Drop the reference so the 1 Hz tick stops driving a closed window."""
+        self._live_view_window = None
 
     def load_settings(self):
         """ Load the UI settings.
@@ -1455,6 +1491,11 @@ class SolarEclipseController(Observer):
         default_time_format, *_ = TIME_FORMATS
         time_format = self.view.settings.value("time_format", default_time_format, type=str)
         self.set_datetime_format(date_format, time_format)
+
+        # Live view
+
+        self.view.live_view_enabled = self.view.settings.value(
+            "live_view_enabled", True, type=bool)
 
         # Location
 
@@ -1866,12 +1907,22 @@ class SettingsPopup(QWidget, Observable):
         self.date_combobox.setCurrentText(observer.view.date_format)
         self.time_combobox.setCurrentText(observer.view.time_format)
 
+        # Field fallback: unticking this makes the Live View toolbar button refuse to
+        # open, so the camera is never touched for preview at all.  One click, no
+        # restart -- which is the point on eclipse morning.
+        self.live_view_checkbox = QCheckBox("Enable live view")
+        self.live_view_checkbox.setToolTip(
+            "Untick to stop the Live View window from opening or contacting the camera"
+        )
+        self.live_view_checkbox.setChecked(observer.view.live_view_enabled)
+        layout.addWidget(self.live_view_checkbox, 2, 0, 1, 2)
+
         ok_button = QPushButton("OK")
         ok_button.clicked.connect(self.accept_settings)
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.cancel_settings)
-        layout.addWidget(ok_button, 2, 0)
-        layout.addWidget(cancel_button, 2, 1)
+        layout.addWidget(ok_button, 3, 0)
+        layout.addWidget(cancel_button, 3, 1)
 
         self.setLayout(layout)
 
@@ -2186,35 +2237,519 @@ class EclipsePlotWidget(QtWidgets.QWidget):
     #         self.ax.text(x, y, label, ha="center", va="center", fontsize=10, color="dimgray")
 
 
+# The solar filter is off from C2-20s to C3+20s.  Live view holds the mirror up and
+# the sensor exposed, so it is locked out across that span with 5 s of margin at each
+# end -- ahead of the operator's hands reaching the filter cell, and behind them
+# leaving it.  Nothing about this window may depend on scheduler state.
+LIVE_VIEW_LOCKOUT_LEAD = datetime.timedelta(seconds=25)
+LIVE_VIEW_LOCKOUT_TRAIL = datetime.timedelta(seconds=25)
+
+
+# Preview grab rate.  The 80D sustains 30 fps over USB (33 ms per frame, measured, and
+# magnification costs nothing), so the previous 1 fps was discarding 29 frames out of
+# 30.  10 fps is responsive under the focuser while holding the USB lock only about a
+# third of the time -- a shot that does arrive waits ~33 ms against a 1.5 s budget.
+# Deliberately short of what the body can do: 30 fps buys nothing the eye can use, and
+# hours of full-rate live view warm the sensor, which lands as noise in the totality
+# frames.
+LIVE_VIEW_INTERVAL_S = 0.1
+
+# Frame-queue poll.  Must stay well under the grab interval or the display becomes the
+# bottleneck and the extra frames are fetched over USB only to be dropped.
+LIVE_VIEW_POLL_MS = 33
+
+# A manual test frame needs room: it takes the USB lock for the capture and again for
+# the download, which is far longer than a scheduled shot's drop budget allows.
+CAPTURE_REVIEW_CLEARANCE_S = 20.0
+
+# Values offered for a review capture.  Picked rather than typed: these strings are
+# matched against the camera's own choice list, and a near miss ("1/2500s", "f4.7")
+# fails at the camera rather than in the field where it can be corrected.
+REVIEW_SHUTTER_SPEEDS = (
+    "1/8000", "1/6400", "1/5000", "1/4000", "1/3200", "1/2500", "1/2000", "1/1600",
+    "1/1250", "1/1000", "1/800", "1/640", "1/500", "1/400", "1/320", "1/250",
+    "1/200", "1/160", "1/125", "1/100", "1/80", "1/60", "1/50", "1/40", "1/30",
+    "1/25", "1/20", "1/15", "1/13", "1/10", "1/8", "1/6", "1/5", "1/4", "0.3",
+    "0.4", "0.5", "0.6", "0.8", "1", "1.3", "1.6", "2", "2.5", "3.2", "4",
+)
+# The GT81 has no electronic aperture, so 4.7 is the working value; the rest are
+# there for a camera lens on the bench.
+REVIEW_APERTURES = ("4.7", "4", "5.6", "8", "11", "16")
+REVIEW_ISOS = ("100", "200", "400", "800", "1600", "3200", "6400")
+
+# Jobs that contend for the camera USB lock.  voice_prompt and execute_command do
+# not touch the camera, so live view has no reason to stand down for them.
+_CAMERA_JOB_FUNCS = frozenset({
+    "take_picture", "take_burst", "take_bracket", "take_hdr", "sync_cameras",
+})
+
+
+def seconds_to_next_camera_job(scheduler) -> float | None:
+    """Seconds until the next scheduled job that needs the camera, or None.
+
+    Reads the running schedule rather than any script on disk, so it is exact for
+    whatever sequence is actually loaded.
+    """
+    if scheduler is None:
+        return None
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        times = [job.next_run_time for job in scheduler.get_jobs()
+                 if job.next_run_time and job.func.__name__ in _CAMERA_JOB_FUNCS]
+        return min((t - now).total_seconds() for t in times) if times else None
+    except Exception:
+        LOGGER.exception("Could not work out the time to the next camera job")
+        return None
+
+
+def live_view_locked_out(now_utc, c2_info, c3_info) -> bool:
+    """True while the solar filter is off, so live view must not run.
+
+    Deliberately not extended to C1 and C4: the filter is on through both, so there is
+    no safety case for locking out there, and the schedule guard covers their tightly
+    spaced contact shots more precisely than a fixed window around the contact could.
+
+    A partial eclipse has no C2 or C3 and never loses its filter, so this is False
+    throughout -- correct, and the reason the check is on the contacts rather than on
+    "is an eclipse happening".
+    """
+    if c2_info is None or c3_info is None:
+        return False
+    return (c2_info.time_utc - LIVE_VIEW_LOCKOUT_LEAD) <= now_utc <= \
+        (c3_info.time_utc + LIVE_VIEW_LOCKOUT_TRAIL)
+
+
+def _readout_style(colour: str = "palette(text)", background: str = "transparent",
+                   monospace: bool = True) -> str:
+    """Stylesheet for a readout label whose geometry must not move.
+
+    Padding and radius are always present, even when nothing is highlighted: adding
+    them only for a warning changes the label's size hint, which reflows the layout and
+    makes the image above jump at the exact moment the operator is reading it.
+    """
+    font = "font-family: monospace; " if monospace else ""
+    return (f"{font}padding: 3px; border-radius: 3px; "
+            f"color: {colour}; background: {background};")
+
+
+def _fix_readout_height(*labels) -> None:
+    """Pin label heights so text arriving or clearing cannot reflow the window."""
+    for label in labels:
+        label.setFixedHeight(label.fontMetrics().height() + 10)
+
+
+def describe_exposure(grey: np.ndarray) -> str:
+    """Plain summary of how a captured frame is exposed.
+
+    The reason a review capture needs this: a frame can be black because the settings
+    are wrong, or black because they are right and there is nothing bright in front of
+    the camera. Those look identical on screen and mean opposite things, so the numbers
+    have to be shown rather than left to the eye.
+    """
+    peak = float(grey.max())
+    mean = float(grey.mean())
+    blown = float(np.count_nonzero(grey >= 254) / grey.size)
+    # Share of the frame carrying real signal, which for a solar frame is the disc.
+    lit = float(np.count_nonzero(grey > 32) / grey.size)
+
+    if peak < 16:
+        verdict = "nothing registered — no bright subject, or badly under-exposed"
+    elif blown > 0.02:
+        verdict = "blown highlights — shorten the exposure or drop ISO"
+    elif peak < 100:
+        verdict = "dim — a solar disc should be much brighter than this"
+    elif lit < 0.001:
+        verdict = "bright spot present but tiny — is the sun in frame?"
+    else:
+        verdict = "usable"
+
+    return (f"peak {peak:3.0f}/255 · mean {mean:5.1f} · lit {lit:5.1%} · "
+            f"blown {blown:.2%}  —  {verdict}")
+
+
+def _qimage_to_grey(image: QImage) -> np.ndarray:
+    """QImage -> 2-D float array of luminance, without a copy per channel.
+
+    Qt's Grayscale8 conversion does the colour maths in C, which matters at 10 fps on
+    a 1200x800 frame.  The row stride is honoured because Qt pads rows to a 4-byte
+    boundary and ignoring it shears the image.
+    """
+    grey = image.convertToFormat(QImage.Format.Format_Grayscale8)
+    width, height = grey.width(), grey.height()
+    buffer = grey.constBits()
+    buffer.setsize(grey.sizeInBytes())
+    return np.frombuffer(buffer, dtype=np.uint8).reshape(
+        height, grey.bytesPerLine())[:, :width].astype(np.float64)
+
+
+class _ReviewCaptureWorker(QObject):
+    """Runs one review capture off the GUI thread.
+
+    The capture blocks for a second or two and the download for longer, so doing it
+    inline would freeze the window over exactly the interval the operator is watching.
+    """
+
+    done = pyqtSignal(object)
+
+    #: How long to give the preview thread to drop the mirror before shooting anyway.
+    MIRROR_DOWN_WAIT_S = 3.0
+
+    def __init__(self, camera, settings, live_view_thread=None, parent=None):
+        super().__init__(parent)
+        self._camera = camera
+        self._settings = settings
+        self._live_view_thread = live_view_thread
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            # Wait for the mirror to actually come down.  pause() only asks, and the
+            # worker acts on its next tick; shooting before then means the capture
+            # drags the body out of live view itself, which is slower and is the
+            # transition cost the schedule guard exists to avoid.
+            if self._live_view_thread is not None:
+                if not self._live_view_thread.wait_for_live_view_off(
+                        self.MIRROR_DOWN_WAIT_S):
+                    LOGGER.warning(
+                        "Live view did not stand down within %.1fs; capturing anyway",
+                        self.MIRROR_DOWN_WAIT_S)
+            shot = capture_for_review(self._camera, self._settings)
+        except Exception as exc:
+            LOGGER.exception("Review capture failed")
+            shot = ReviewShot(reason=str(exc))
+        # Queued across threads, so the handler runs on the GUI thread.
+        self.done.emit(shot)
+
+
+class PreviewView(QGraphicsView):
+    """Pan/zoom viewer for live-view frames.
+
+    Replaces scaling the pixmap down to fit a label, which threw away most of the
+    frame: at 5x the stream is a 1:1 crop of the sensor, so every discarded pixel was
+    a pixel the sensor actually resolved.  Judging focus needs those pixels on screen
+    at 1:1 or larger, not a smooth reduction of them.
+
+    The view transform survives frame replacement, so the operator can sit at 400% on
+    a limb while frames stream underneath at 10 fps.
+    """
+
+    # Below 1:1 the image is being reduced and smoothing genuinely looks better; at or
+    # above it, smoothing invents detail that is not in the data and makes a defocused
+    # limb look acceptable.  This is a focus tool, so show the pixels.
+    _SMOOTH_BELOW = 1.0
+    _MIN_SCALE = 0.05
+    _MAX_SCALE = 16.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._item = QGraphicsPixmapItem()
+        self._scene.addItem(self._item)
+
+        self._crosshair: list = []
+        self._overlay: list = []
+        self._guides_visible = True
+        self._frame_size = None
+        self._fit_mode = True
+
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setBackgroundBrush(QBrush(QColor(20, 20, 20)))
+        self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+
+    # -- frames ---------------------------------------------------------
+
+    def set_frame(self, pixmap: QPixmap) -> None:
+        """Show a new frame, keeping the current zoom and pan."""
+        size = (pixmap.width(), pixmap.height())
+        self._item.setPixmap(pixmap)
+
+        if size != self._frame_size:
+            # A new frame size means the zoom level changed on the camera, so the old
+            # scene rect and crosshair no longer describe the image.
+            self._frame_size = size
+            self._scene.setSceneRect(0, 0, size[0], size[1])
+            self._rebuild_crosshair()
+            self.clear_overlay()
+            if self._fit_mode:
+                self.fit()
+
+        self._apply_transformation_mode()
+
+    def _rebuild_crosshair(self) -> None:
+        for line in self._crosshair:
+            self._scene.removeItem(line)
+        self._crosshair = []
+        if not self._frame_size:
+            return
+
+        width, height = self._frame_size
+        pen = QPen(QColor(0, 120, 255))
+        # Zero width keeps the line one pixel wide on screen at any zoom, so the
+        # reticle never grows into the detail it is meant to sit beside.
+        pen.setWidth(0)
+        for x1, y1, x2, y2 in ((0, height / 2, width, height / 2),
+                               (width / 2, 0, width / 2, height)):
+            line = self._scene.addLine(x1, y1, x2, y2, pen)
+            # A frame-size change must not bring the guides back while a still is
+            # being inspected.
+            line.setVisible(self._guides_visible)
+            self._crosshair.append(line)
+
+    # -- centring overlay -----------------------------------------------
+
+    def set_guides_visible(self, visible: bool) -> None:
+        """Show or hide the reticle and centring guides.
+
+        Hidden while inspecting a captured frame: the guides describe a live-view
+        frame's geometry, and leaving them over a still both misleads and obscures the
+        detail the still was taken to show.
+        """
+        for item in self._crosshair + self._overlay:
+            item.setVisible(visible)
+        self._guides_visible = visible
+
+    def clear_overlay(self) -> None:
+        for item in self._overlay:
+            self._scene.removeItem(item)
+        self._overlay = []
+
+    def show_centring(self, disc_centre, disc_radius, tolerance, within: bool) -> None:
+        """Draw the fitted limb and the framing tolerance, in image coordinates.
+
+        Scene items rather than paint on the pixmap, so the guides stay one screen
+        pixel wide and stay registered to the image at any zoom.
+        """
+        self.clear_overlay()
+        if not self._frame_size:
+            return
+        width, height = self._frame_size
+        cx, cy = width / 2.0, height / 2.0
+        semi_x, semi_y = tolerance
+
+        # Amber once the corona would clip; the tolerance is only worth drawing if it
+        # says something when crossed.
+        colour = QColor(0, 200, 120) if within else QColor(230, 160, 0)
+
+        pen = QPen(colour)
+        pen.setWidth(0)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        self._overlay.append(self._scene.addEllipse(
+            cx - semi_x, cy - semi_y, semi_x * 2, semi_y * 2, pen))
+
+        limb_pen = QPen(QColor(0, 120, 255))
+        limb_pen.setWidth(0)
+        self._overlay.append(self._scene.addEllipse(
+            disc_centre[0] - disc_radius, disc_centre[1] - disc_radius,
+            disc_radius * 2, disc_radius * 2, limb_pen))
+
+        marker_pen = QPen(colour)
+        marker_pen.setWidth(0)
+        span = max(6.0, disc_radius * 0.08)
+        for x1, y1, x2, y2 in (
+                (disc_centre[0] - span, disc_centre[1], disc_centre[0] + span, disc_centre[1]),
+                (disc_centre[0], disc_centre[1] - span, disc_centre[0], disc_centre[1] + span)):
+            self._overlay.append(self._scene.addLine(x1, y1, x2, y2, marker_pen))
+
+    # -- zoom -----------------------------------------------------------
+
+    def current_scale(self) -> float:
+        return self.transform().m11()
+
+    def _apply_transformation_mode(self) -> None:
+        smooth = self.current_scale() < self._SMOOTH_BELOW
+        self._item.setTransformationMode(
+            Qt.TransformationMode.SmoothTransformation if smooth
+            else Qt.TransformationMode.FastTransformation)
+
+    def fit(self) -> None:
+        self._fit_mode = True
+        if self._frame_size:
+            self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+        self._apply_transformation_mode()
+
+    def set_scale(self, factor: float) -> None:
+        self._fit_mode = False
+        factor = max(self._MIN_SCALE, min(self._MAX_SCALE, factor))
+        self.resetTransform()
+        self.scale(factor, factor)
+        self._apply_transformation_mode()
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if not delta:
+            return
+        step = 1.25 if delta > 0 else 1 / 1.25
+        target = self.current_scale() * step
+        if not (self._MIN_SCALE <= target <= self._MAX_SCALE):
+            return
+        self._fit_mode = False
+        self.scale(step, step)
+        self._apply_transformation_mode()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Only Fit tracks the window; an explicit zoom is the operator's choice and
+        # must not be silently undone by a resize.
+        if self._fit_mode:
+            self.fit()
+
+
 class LiveViewWindow(QWidget):
     """Floating window that shows a live-view preview from a gphoto2 camera.
 
-    A background ``LiveViewThread`` grabs one preview frame per second.  When
+    A background ``LiveViewThread`` grabs preview frames at LIVE_VIEW_INTERVAL_S.  When
     the camera USB lock is held by a scheduled shot the frame is silently
     skipped so timing accuracy is never compromised.
 
     The window can be:
       - Disabled/re-enabled at any time via the toggle button.
-      - Auto-paused between C2 and C3 (totality) by the controller calling
-        ``set_totality_paused(True/False)``.
+      - Locked out across the filter-off window by the controller calling
+        ``set_locked_out(True/False)``.  The lockout takes the camera out of live
+        view and refuses to be overridden; it is not merely a pause.
     """
 
-    def __init__(self, camera, parent=None):
+    closed = pyqtSignal()
+
+    def __init__(self, camera, parent=None, locked_out: bool = False,
+                 next_event_provider=None):
         super().__init__(parent, Qt.WindowType.Window)
         self.setMinimumSize(480, 400)
 
         self._camera = camera
+        self._next_event_provider = next_event_provider
+        self._held_shown: int | None = None
         self._thread = None
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._user_enabled: bool = True
-        self._totality_paused: bool = False
+        # Set before the thread starts.  Waiting for the controller's next 1 Hz tick
+        # would let one frame through first, and that frame engages live view on the
+        # body -- mirror up, no filter.
+        self._locked_out: bool = locked_out
 
         self.setWindowTitle(f"Live View — {camera.name}")
 
         # Image display
-        self._image_label = QLabel("Waiting for first preview frame…")
-        self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._image_label.setMinimumSize(320, 240)
+        self._view = PreviewView()
+        self._view.setMinimumSize(320, 240)
+
+        self._waiting_label = QLabel("Waiting for first preview frame…")
+        self._waiting_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._waiting_label.setStyleSheet(_readout_style(colour="gray", monospace=False))
+
+        # View scale controls
+        self._scale_buttons = QHBoxLayout()
+        for label, action in (("Fit", self._view.fit),
+                              ("1:1", lambda: self._view.set_scale(1.0)),
+                              ("200%", lambda: self._view.set_scale(2.0)),
+                              ("400%", lambda: self._view.set_scale(4.0))):
+            button = QPushButton(label)
+            button.setToolTip("Wheel to zoom, drag to pan")
+            button.clicked.connect(action)
+            self._scale_buttons.addWidget(button)
+
+        # One switch for every measurement aid, whichever the current zoom offers:
+        # centring at 1x, focus at 5x.  Turning it off also stops the work, not just
+        # the display -- the focus metric costs a tenth of the frame interval -- and
+        # leaves a clean image for simply looking at.
+        self._measure_enabled = True
+        self._measure_check = QCheckBox("Measure")
+        self._measure_check.setToolTip(
+            "1×: reticle, fitted limb, framing tolerance, offset and drift\n"
+            "5×: limb sharpness and the focus hint")
+        self._measure_check.setChecked(True)
+        self._measure_check.toggled.connect(self._on_measure_toggled)
+        self._scale_buttons.addWidget(self._measure_check)
+
+        # Focus readout
+        self._sharpness_envelope = RollingEnvelope()
+        self._focus_tracker = FocusTracker()
+        self._sharpness_label = QLabel()
+        self._sharpness_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._sharpness_label.setStyleSheet(_readout_style())
+        self._focus_hint_label = QLabel()
+        self._focus_hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Centring readout
+        self._drift_tracker = DriftTracker()
+        self._sky = SkyOrientation()
+        self._calibrating_until: float | None = None
+        self._centring_label = QLabel()
+        self._centring_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._centring_label.setStyleSheet(_readout_style())
+        self._calibrate_btn = QPushButton("Calibrate sky")
+        self._calibrate_btn.setToolTip(
+            "Learn which way the frame is pointing, so drift can be reported as "
+            "north/south/east/west instead of an image angle")
+        self._calibrate_btn.clicked.connect(self._on_calibrate_sky)
+
+        # Exposure check.  Defaults match a mid partial-phase frame; the point is to
+        # try the settings the sequence will actually use, before it uses them.
+        self._reviewing = False
+        self._review_worker = None
+        # Asked of the camera, so the lists match what this body and lens accept.  A
+        # control the camera does not offer is hidden rather than filled from a
+        # default: a telescope has no electronic aperture, and an f-number that cannot
+        # be applied is worse than no f-number at all.
+        simulated = isinstance(camera, VirtualCamera)
+        choices = {} if simulated else read_exposure_choices(camera)
+        self._shutter_edit = QComboBox()
+        self._shutter_edit.addItems(
+            REVIEW_SHUTTER_SPEEDS if simulated else choices.get("shutterspeed", []))
+        self._aperture_edit = QComboBox()
+        self._aperture_edit.addItems(
+            REVIEW_APERTURES if simulated else choices.get("aperture", []))
+        self._iso_edit = QComboBox()
+        self._iso_edit.addItems(REVIEW_ISOS if simulated else choices.get("iso", []))
+
+        # Start from what the camera is already set to, so opening the window does not
+        # silently change the exposure the preview is showing.
+        self._original_exposure = (
+            None if isinstance(camera, VirtualCamera) else read_exposure_settings(camera))
+        if self._original_exposure is not None:
+            self._shutter_edit.setCurrentText(self._original_exposure.shutter_speed)
+            self._aperture_edit.setCurrentText(self._original_exposure.aperture)
+            self._iso_edit.setCurrentText(str(self._original_exposure.iso))
+        for combo in (self._shutter_edit, self._aperture_edit, self._iso_edit):
+            combo.currentTextChanged.connect(self._on_exposure_changed)
+        self._capture_btn = QPushButton("Capture && check")
+        self._capture_btn.setToolTip(
+            "Take one frame with these settings and inspect it, then discard it")
+        self._capture_btn.clicked.connect(self._on_capture_for_review)
+        self._discard_btn = QPushButton("Discard, back to live view")
+        self._discard_btn.clicked.connect(self._end_review)
+        self._discard_btn.setVisible(False)
+
+        self._exposure_row = QHBoxLayout()
+        for label, widget in (("Shutter", self._shutter_edit),
+                              ("f/", self._aperture_edit),
+                              ("ISO", self._iso_edit)):
+            caption = QLabel(label)
+            self._exposure_row.addWidget(caption)
+            self._exposure_row.addWidget(widget)
+            if widget.count() == 0:
+                caption.setVisible(False)
+                widget.setVisible(False)
+        self._exposure_row.addWidget(self._capture_btn)
+        self._exposure_row.addWidget(self._discard_btn)
+        self._exposure_row.addStretch(1)
+
+        # Last 1x disc fit and the frame it came from, so "Zoom to limb" can aim
+        # without waiting for another frame.
+        self._last_fit = None
+        self._last_frame_width = None
+        self._last_grey = None
+        self._limb_btn = QPushButton("Zoom to limb")
+        self._limb_btn.setToolTip(
+            "Magnify a sunlit part of the limb, chosen away from the moon")
+        self._limb_btn.clicked.connect(self._on_zoom_to_limb)
+        if isinstance(camera, VirtualCamera):
+            self._limb_btn.setEnabled(False)
+            self._limb_btn.setToolTip("Zoom needs a physical camera")
 
         # Timestamp of last received frame
         self._timestamp_label = QLabel()
@@ -2228,23 +2763,46 @@ class LiveViewWindow(QWidget):
         # Buttons
         self._toggle_btn = QPushButton("Disable Live View")
         self._toggle_btn.clicked.connect(self._on_toggle)
+        self._zoom_requested: int = 1
+        self._zoom_btn = QPushButton()
+        self._zoom_btn.clicked.connect(self._on_zoom)
+        if isinstance(camera, VirtualCamera):
+            self._zoom_btn.setEnabled(False)
+            self._zoom_btn.setToolTip("Zoom needs a physical camera")
+        self._update_zoom_button()
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.close)
 
         btn_layout = QHBoxLayout()
         btn_layout.addWidget(self._toggle_btn)
+        btn_layout.addWidget(self._zoom_btn)
+        btn_layout.addWidget(self._limb_btn)
+        btn_layout.addWidget(self._calibrate_btn)
         btn_layout.addWidget(close_btn)
 
         layout = QVBoxLayout()
-        layout.addWidget(self._image_label, stretch=1)
+        layout.addWidget(self._waiting_label)
+        layout.addWidget(self._view, stretch=1)
+        layout.addLayout(self._scale_buttons)
+        layout.addLayout(self._exposure_row)
+        layout.addWidget(self._centring_label)
+        layout.addWidget(self._sharpness_label)
+        layout.addWidget(self._focus_hint_label)
         layout.addWidget(self._timestamp_label)
         layout.addWidget(self._status_label)
         layout.addLayout(btn_layout)
         self.setLayout(layout)
+        self._view.setVisible(False)
 
-        # Poll the frame queue every 500 ms on the GUI thread
+        # Readouts appear, clear and change colour constantly; pinning their heights
+        # keeps every one of those from resizing the image above them.
+        _fix_readout_height(self._centring_label, self._sharpness_label,
+                            self._focus_hint_label, self._timestamp_label,
+                            self._status_label)
+
+        # Drain the frame queue on the GUI thread, faster than frames arrive
         self._poll_timer = QTimer(self)
-        self._poll_timer.setInterval(500)
+        self._poll_timer.setInterval(LIVE_VIEW_POLL_MS)
         self._poll_timer.timeout.connect(self._poll_frame)
         self._poll_timer.start()
 
@@ -2260,9 +2818,13 @@ class LiveViewWindow(QWidget):
         self._thread = LiveViewThread(
             camera=self._camera,
             frame_callback=self._on_frame,
-            interval_s=1.0,
+            interval_s=LIVE_VIEW_INTERVAL_S,
+            start_paused=self._locked_out,
+            next_event_provider=self._next_event_provider,
         )
         self._thread.start()
+        self._zoom_requested = 1
+        self._update_zoom_button()
         self._update_status_label()
 
     def _on_frame(self, jpeg_bytes: bytes):
@@ -2274,9 +2836,23 @@ class LiveViewWindow(QWidget):
 
     def _poll_frame(self):
         """Called on the Qt main thread by the poll timer; updates the image."""
+        # Before the queue check: while the worker is standing down for a shot no
+        # frames arrive at all, and that is exactly when the countdown has to tick.
+        # Only on a whole-second change, since the label is refreshed far more often
+        # than it can say anything new.
+        held = self._thread.held_seconds if self._thread is not None else None
+        shown = None if held is None else int(held)
+        if shown != self._held_shown:
+            self._held_shown = shown
+            self._update_status_label()
+
         try:
             jpeg_bytes, ts = self._frame_queue.get_nowait()
         except queue.Empty:
+            return
+
+        # A late live-view frame must not paint over the still being inspected.
+        if self._reviewing:
             return
         if isinstance(jpeg_bytes, memoryview):
             jpeg_bytes = jpeg_bytes.tobytes()
@@ -2289,58 +2865,465 @@ class LiveViewWindow(QWidget):
         image = QImage.fromData(jpeg_bytes)
         if image.isNull():
             return
-        pixmap = QPixmap.fromImage(image)
-        scaled = pixmap.scaled(
-            self._image_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        # Draw blue crosshair at the centre of the scaled pixmap
-        w, h = scaled.width(), scaled.height()
-        painter = QPainter(scaled)
-        pen = QPen(QColor(0, 120, 255))
-        pen.setWidth(1)
-        painter.setPen(pen)
-        painter.drawLine(0, h // 2, w, h // 2)  # horizontal
-        painter.drawLine(w // 2, 0, w // 2, h)  # vertical
-        painter.end()
-        self._image_label.setPixmap(scaled)
+        self._view.set_frame(QPixmap.fromImage(image))
+        if not self._view.isVisible():
+            self._view.setVisible(True)
+            self._waiting_label.setVisible(False)
         self._timestamp_label.setText("Last frame: " + ts.strftime("%Y-%m-%d  %H:%M:%S"))
 
-    def _apply_state(self):
-        """Push the user+totality state into the thread and refresh the button."""
+        try:
+            grey = _qimage_to_grey(image)
+        except Exception:
+            LOGGER.exception("Could not convert the preview frame for measurement")
+            return
+        # Centring always runs: it is a millisecond, and "Zoom to limb" needs the fit
+        # whether or not the numbers are on screen.  The focus metric costs a tenth of
+        # the frame interval, so that one is genuinely skipped when it is not wanted.
+        self._update_centring(grey, ts)
+        if self._measure_enabled:
+            self._update_sharpness(grey, ts)
+        # Zoom state only shows up in frame dimensions, so refresh with each frame.
+        thread = self._thread
+        if thread is not None:
+            if thread.zoom_error and self._zoom_requested != thread.zoom_level:
+                self._zoom_requested = thread.zoom_level
+                self._update_zoom_button()
+                self._update_status_label()
+            elif self._zoom_requested != 1 or thread.zoom_level != 1:
+                self._update_status_label()
+
+    #: How long the untracked run has to be to pin the frame to the sky.  Long enough
+    #: that the disc fit's own jitter cannot rotate the answer, short enough that the
+    #: sun stays in frame with the drive stopped.
+    SKY_CALIBRATION_S = 30.0
+
+    def _current_exposure(self) -> CameraSettings:
+        return CameraSettings(
+            self._camera.name,
+            self._shutter_edit.currentText(),
+            self._aperture_edit.currentText(),
+            int(self._iso_edit.currentText()) if self._iso_edit.currentText().isdigit() else 0)
+
+    def _on_exposure_changed(self):
+        """Programme the new exposure so the preview shows what it looks like.
+
+        Live view on this body simulates the exposure it is set to, so writing the
+        settings turns choosing one into something visible immediately rather than a
+        shutter-and-download round trip per guess.
+        """
+        if self._locked_out or self._reviewing or isinstance(self._camera, VirtualCamera):
+            return
+
+        settings = self._current_exposure()
+
+        def apply():
+            try:
+                apply_exposure(self._camera, settings)
+            except Exception:
+                # Serialised like any other camera call, so a busy USB drops this
+                # write rather than delaying a shot.  The next change will retry.
+                LOGGER.exception("Could not apply the preview exposure")
+
+        threading.Thread(target=apply, daemon=True).start()
+
+    def _on_measure_toggled(self, enabled: bool) -> None:
+        self._measure_enabled = enabled
+        # Not while a still is up: review hides the guides regardless, and turning them
+        # on there would draw a live-view geometry over a captured frame.
+        if not self._reviewing:
+            self._view.set_guides_visible(enabled)
+            if not enabled:
+                self._view.clear_overlay()
+        # During review this line carries the exposure verdict, which is the point of
+        # the capture rather than a measurement aid, so it stays either way.
+        self._centring_label.setVisible(enabled or self._reviewing)
+        self._sharpness_label.setVisible(enabled)
+        self._focus_hint_label.setVisible(enabled)
+        # History gathered before the switch describes a stretch the operator was not
+        # watching, so start again rather than resume mid-story.
+        self._sharpness_envelope.clear()
+        self._focus_tracker.clear()
+        self._drift_tracker.clear()
+
+    def _set_reviewing(self, reviewing: bool) -> None:
+        """Show only what makes sense while a still is on screen.
+
+        Everything else here acts on a live preview that is paused: another capture,
+        a zoom the camera cannot perform on a still, a sky calibration that needs
+        moving frames.  Leaving them active invites clicks that quietly do nothing.
+        """
+        self._reviewing = reviewing
+        self._capture_btn.setVisible(not reviewing)
+        self._discard_btn.setVisible(reviewing)
+        # The readout doubles as the exposure verdict while reviewing.
+        self._centring_label.setVisible(self._measure_enabled or reviewing)
+        for widget in (self._shutter_edit, self._aperture_edit, self._iso_edit,
+                       self._toggle_btn, self._calibrate_btn):
+            widget.setEnabled(not reviewing)
+        if reviewing:
+            self._zoom_btn.setEnabled(False)
+            self._limb_btn.setEnabled(False)
+        else:
+            # Those two depend on the camera and the lockout, so _apply_state owns
+            # them; re-enabling here would hand the simulator a zoom it cannot do.
+            self._apply_state()
+
+    def _on_capture_for_review(self):
+        """Take one frame with the entered settings and show it for inspection."""
+        if self._thread is None or self._reviewing:
+            return
+        if self._locked_out:
+            QMessageBox.warning(
+                self, "Filter is off",
+                "Not while the solar filter is off.  Wait for the lockout to clear.")
+            return
+
+        # A manual shot must not land on top of a scheduled one.
+        if self._next_event_provider is not None:
+            t_next = self._next_event_provider()
+            if t_next is not None and t_next < CAPTURE_REVIEW_CLEARANCE_S:
+                QMessageBox.warning(
+                    self, "Shot due",
+                    f"A scheduled shot is {t_next:.0f}s away.  Wait until the "
+                    "sequence has room before taking a test frame.")
+                return
+
+        settings = self._current_exposure()
+
+        # Out of live view first, so the shot does not pay a mode transition and the
+        # preview thread is not competing for the USB lock while the file downloads.
+        self._set_reviewing(True)
+        self._thread.pause()
+        self._centring_label.setText(
+            f"Mirror down, capturing {settings.shutter_speed}, "
+            f"f/{settings.aperture}, ISO {settings.iso} — then downloading…")
+        self._centring_label.setStyleSheet(_readout_style())
+
+        self._review_worker = _ReviewCaptureWorker(
+            self._camera, settings, live_view_thread=self._thread, parent=self)
+        self._review_worker.done.connect(self._on_review_captured)
+        self._review_worker.start()
+
+    def _on_review_captured(self, shot):
+        """Show the captured frame, or say why there isn't one."""
+        def failed(reason):
+            # Stay in review so the message survives.  Resuming live view here would
+            # let the next frame's centring readout overwrite it within 100 ms, and
+            # the operator would see the preview return with no idea what went wrong.
+            self._centring_label.setText(f"Capture failed — {reason}")
+            self._centring_label.setStyleSheet(
+                _readout_style(colour="#721C24", background="#F8D7DA"))
+            self._timestamp_label.setText(
+                "No frame to show — press discard to return to live view")
+
+        if not shot.ok:
+            failed(shot.reason)
+            return
+
+        image = QImage.fromData(shot.jpeg)
+        if image.isNull():
+            failed(f"could not decode {shot.name} ({len(shot.jpeg)} bytes)")
+            return
+
+        self._view.clear_overlay()
+        self._view.set_guides_visible(False)
+        self._view.set_frame(QPixmap.fromImage(image))
+        self._view.fit()
+        source = ("JPEG preview embedded in the raw file" if shot.embedded_preview
+                  else "captured frame")
+        self._timestamp_label.setText(
+            f"{shot.name} — {source}, {image.width()}×{image.height()}; "
+            "zoom in to check focus, discard when done")
+
+        try:
+            summary = describe_exposure(_qimage_to_grey(image))
+        except Exception:
+            LOGGER.exception("Could not summarise the captured exposure")
+            summary = "exposure could not be measured"
+        self._centring_label.setText(summary)
+        self._centring_label.setStyleSheet(_readout_style())
+
+    def _end_review(self):
+        """Drop the captured frame and let live view take the window back."""
+        self._set_reviewing(False)
+        self._view.set_guides_visible(self._measure_enabled)
+        # Measurements taken on the still describe a different image scale entirely.
+        self._sharpness_envelope.clear()
+        self._focus_tracker.clear()
+        self._drift_tracker.clear()
+        self._view.clear_overlay()
+        self._apply_state()
+
+    def _on_zoom_to_limb(self):
+        """Magnify a sunlit limb, aimed from the current disc fit.
+
+        Without this, magnifying jumps to wherever the camera last left the box, which
+        for an off-centre sun can be empty sky.
+        """
         if self._thread is None:
             return
-        if self._user_enabled and not self._totality_paused:
-            self._thread.resume()
-            self._toggle_btn.setText("Disable Live View")
+        if self._last_fit is None or self._last_frame_width is None:
+            QMessageBox.information(
+                self, "No disc found",
+                "Zoom to limb needs the sun located first.  Switch to 1× and wait for "
+                "the blue circle to settle on the limb, then try again.")
+            return
+
+        target = limb_target(self._last_fit, self._last_grey)
+        position = zoom_rect_position(target, self._last_frame_width, zoom=5)
+        if self._thread.request_zoom(5, position=position):
+            self._zoom_requested = 5
+            self._sharpness_envelope.clear()
+            self._focus_tracker.clear()
+            self._drift_tracker.clear()
+            self._update_zoom_button()
+            self._update_status_label()
+
+    def _on_calibrate_sky(self):
+        """Start (or cancel) learning the frame's orientation from untracked drift."""
+        if self._calibrating_until is not None:
+            self._calibrating_until = None
+            self._calibrate_btn.setText("Calibrate sky")
+            return
+
+        if self._zoom_requested != 1:
+            QMessageBox.information(
+                self, "Zoom out first",
+                "Sky calibration needs the whole disc in frame.  Switch to 1× and "
+                "try again.")
+            return
+
+        answer = QMessageBox.question(
+            self, "Calibrate sky orientation",
+            "Switch the mount's tracking OFF, then continue.\n\n"
+            "With the drive stopped the sun drifts due west, so watching it for "
+            f"{self.SKY_CALIBRATION_S:.0f} seconds tells Solar Eclipse Workbench which "
+            "way the frame is pointing.  Drift can then be reported as north/south/"
+            "east/west instead of an angle in the image.\n\n"
+            "Turn tracking back on when it finishes.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Ok:
+            return
+
+        # A fresh baseline: any samples taken while tracking was still on describe a
+        # different motion and would rotate the result.
+        self._drift_tracker.clear()
+        self._calibrating_until = datetime.datetime.now().timestamp() + self.SKY_CALIBRATION_S
+        self._calibrate_btn.setText("Cancel")
+
+    def _finish_sky_calibration(self, drift) -> str:
+        """Consume a drift reading during calibration; returns a line for the label."""
+        remaining = self._calibrating_until - datetime.datetime.now().timestamp()
+        if remaining > 0:
+            return f"Calibrating sky — tracking off, {remaining:.0f}s remaining"
+
+        if drift is None:
+            self._calibrating_until = None
+            self._calibrate_btn.setText("Calibrate sky")
+            return "Sky calibration failed — no drift measured; was tracking off?"
+
+        arcsec_per_min, bearing = drift
+        self._calibrating_until = None
+        self._calibrate_btn.setText("Re-calibrate sky")
+        # Too slow to trust: with the drive stopped this should be near sidereal, and
+        # a small number means the mount was still tracking, so the bearing is noise.
+        if arcsec_per_min < 100.0:
+            self._sky = SkyOrientation()
+            return (f"Sky calibration failed — only {arcsec_per_min:.0f}\"/min of "
+                    "drift; leave tracking off and retry")
+        self._sky = calibrate_from_untracked_drift(bearing)
+        return f"Sky calibrated — west is {bearing:.0f}° in frame; tracking back on"
+
+    def _update_centring(self, grey: np.ndarray, ts) -> None:
+        """Fit the solar disc and report where it sits and where it is going.
+
+        Only at 1x, where the whole disc is in frame.  A magnified crop shows an arc,
+        and a circle fitted through a short arc has a wildly uncertain centre.
+        """
+        if self._zoom_requested != 1:
+            self._centring_label.clear()
+            self._view.clear_overlay()
+            self._drift_tracker.clear()
+            return
+
+        height, width = grey.shape
+        try:
+            fit = fit_solar_disc(grey)
+        except Exception:
+            LOGGER.exception("Solar disc fit failed")
+            return
+
+        # Kept so "Zoom to limb" can aim immediately, and so the aim comes from a
+        # frame the operator has actually seen the fit drawn on.
+        self._last_fit = fit
+        self._last_frame_width = width
+        self._last_grey = grey
+
+        if fit is None:
+            self._centring_label.setText("Centring — no solar disc in frame")
+            self._centring_label.setStyleSheet(_readout_style(colour="gray"))
+            self._view.clear_overlay()
+            self._drift_tracker.clear()
+            return
+
+        # The fit above is kept regardless, for "Zoom to limb"; everything past here is
+        # the readout the operator switched off.
+        if not self._measure_enabled:
+            return
+
+        dx, dy, dx_arcmin, dy_arcmin, within = offset_from_centre(
+            fit, (width, height), width)
+        if self._measure_enabled:
+            self._view.show_centring(fit.centre, fit.radius,
+                                     tolerance_preview_px(width), within)
+
+        self._drift_tracker.add(fit.centre, ts.timestamp())
+        drift = self._drift_tracker.drift(width)
+
+        if self._calibrating_until is not None:
+            self._centring_label.setText(self._finish_sky_calibration(drift))
+            self._centring_label.setStyleSheet(_readout_style())
+            return
+
+        if drift is None:
+            drift_text = "drift —"
         else:
-            self._thread.pause()
-            self._toggle_btn.setText("Enable Live View")
+            arcsec_per_min, bearing = drift
+            direction = self._sky.describe(bearing)
+            if direction is None:
+                # Without a calibration the frame's orientation is unknown, so this
+                # stays an image angle rather than pretending to name a sky direction.
+                drift_text = (f"drift {arcsec_per_min:6.1f}\"/min "
+                              f"at {bearing:3.0f}° in frame")
+            else:
+                north, _ = self._sky.components(arcsec_per_min, bearing)
+                drift_text = (f"drift {arcsec_per_min:6.1f}\"/min {direction} "
+                              f"({north:+.1f}\"/min N–S)")
+
+        self._centring_label.setText(
+            f"Offset {dx:+6.0f}, {dy:+6.0f} px "
+            f"({dx_arcmin:+5.1f}, {dy_arcmin:+5.1f}′)   ·   {drift_text}")
+        self._centring_label.setStyleSheet(
+            _readout_style() if within else
+            _readout_style(colour="#856404", background="#FFF3CD"))
+
+    def _update_sharpness(self, grey: np.ndarray, ts) -> None:
+        """Measure the limb on this frame and refresh the focus readout.
+
+        Only at 5x.  At 1x the disc spans ~150 preview pixels and a focused limb
+        transition is sub-pixel, so the number would describe JPEG compression rather
+        than focus -- worse than showing nothing, because it looks authoritative.
+        """
+        if self._zoom_requested == 1:
+            self._sharpness_label.setText(
+                "Limb edge width — zoom to 5× to measure focus")
+            self._sharpness_label.setStyleSheet(_readout_style(colour="gray"))
+            self._focus_hint_label.clear()
+            # History from a different magnification does not describe this view.
+            self._sharpness_envelope.clear()
+            self._focus_tracker.clear()
+            return
+
+        try:
+            result = measure_limb_sharpness(grey)
+        except Exception:
+            LOGGER.exception("Limb sharpness measurement failed")
+            return
+
+        if result.clipped:
+            self._sharpness_label.setText(
+                f"⚠  {result.clipped_fraction:.1%} of the crop is blown — "
+                "reduce live-view exposure; a clipped limb reads falsely sharp")
+            self._sharpness_label.setStyleSheet(
+                _readout_style(colour="#856404", background="#FFF3CD"))
+            return
+
+        if not result.ok:
+            self._sharpness_label.setText(f"Limb edge width — {result.reason}")
+            self._sharpness_label.setStyleSheet(_readout_style(colour="gray"))
+            return
+
+        now = ts.timestamp()
+        best = self._sharpness_envelope.add(result.edge_width_px, now)
+        # The tracker reads the envelope, not the raw value: seeing swings single
+        # frames by 2x and would flip the direction hint at random.
+        self._focus_tracker.add(best, now)
+
+        session_best = self._focus_tracker.minimum
+        self._sharpness_label.setText(
+            f"Limb edge width  {best:5.2f} px  ({grade_edge_width(best)})"
+            f"   ·  best this session {session_best:5.2f} px")
+        self._sharpness_label.setStyleSheet(_readout_style())
+
+        state = self._focus_tracker.state
+        self._focus_hint_label.setText(self._focus_tracker.describe(current=best))
+        self._focus_hint_label.setStyleSheet({
+            FocusTracker.IMPROVING: "color: #155724;",
+            FocusTracker.WORSENING: "color: #856404;",
+            FocusTracker.BRACKETED: "color: #155724; font-weight: bold;",
+        }.get(state, _readout_style(colour="gray", monospace=False)))
+
+    def _apply_state(self):
+        """Push the user and lockout state into the thread and refresh the controls."""
+        if self._thread is not None:
+            if self._user_enabled and not self._locked_out:
+                self._thread.resume()
+            else:
+                self._thread.pause()
+        # Outside the thread guard: after the window closes the thread is gone, and the
+        # button and label must still end up in a state that matches reality.
+        self._toggle_btn.setText(
+            "Disable Live View" if self._user_enabled else "Enable Live View")
+        self._toggle_btn.setEnabled(not self._locked_out)
+        usable = (not self._locked_out and not self._reviewing
+                  and not isinstance(self._camera, VirtualCamera))
+        self._zoom_btn.setEnabled(usable)
+        self._limb_btn.setEnabled(usable)
         self._update_status_label()
 
     def _update_status_label(self):
-        if not self._user_enabled:
+        if self._locked_out:
+            # Ranked above "disabled": this one the operator cannot override, and the
+            # reason is the filter rather than a preference.
+            self._status_label.setText("\U0001f512  Locked out — filter is off")
+            self._status_label.setStyleSheet(
+                _readout_style(colour="#721C24", background="#F8D7DA", monospace=False))
+        elif not self._user_enabled:
             self._status_label.setText("○  Disabled")
-            self._status_label.setStyleSheet("color: gray;")
-        elif self._totality_paused:
+            self._status_label.setStyleSheet(_readout_style(colour="gray", monospace=False))
+        elif self._thread is not None and self._thread.held_seconds is not None:
+            # Show the countdown rather than just freezing the image: an operator who
+            # can see the hold waits for it, one who cannot starts clicking.
             self._status_label.setText(
-                "\u23f8  Paused during totality — script has full USB control"
-            )
-            self._status_label.setStyleSheet("color: #856404; background: #FFF3CD; padding: 3px; border-radius: 3px;")
+                f"⏳  Held — next shot in {self._thread.held_seconds:.0f} s")
+            self._status_label.setStyleSheet(
+                _readout_style(colour="#856404", background="#FFF3CD", monospace=False))
         else:
-            self._status_label.setText("\u25cf  Active")
-            self._status_label.setStyleSheet("color: green;")
+            text = "\u25cf  Active"
+            thread = self._thread
+            if thread is not None:
+                if thread.zoom_error:
+                    text += "  \u2014  zoom unavailable"
+                elif self._zoom_requested != 1 or thread.zoom_engaged:
+                    text += f"  \u2014  zoom {self._zoom_requested}\u00d7"
+                    if (self._zoom_requested != 1) != thread.zoom_engaged:
+                        text += " (switching\u2026)"
+            self._status_label.setText(text)
+            self._status_label.setStyleSheet(_readout_style(colour="green", monospace=False))
 
     # ------------------------------------------------------------------
     # Public API (called by the controller)
     # ------------------------------------------------------------------
 
-    def set_totality_paused(self, paused: bool):
-        """Auto-pause or auto-resume live view around totality."""
-        if self._totality_paused == paused:
+    def set_locked_out(self, locked_out: bool):
+        """Enter or leave the filter-off lockout.
+
+        Locking out takes the camera out of live view -- mirror down -- and disables
+        the toggle, so the operator cannot re-enable it while the filter is off.
+        """
+        if self._locked_out == locked_out:
             return
-        self._totality_paused = paused
+        self._locked_out = locked_out
         self._apply_state()
 
     # ------------------------------------------------------------------
@@ -2348,14 +3331,47 @@ class LiveViewWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _on_toggle(self):
+        # A disabled QPushButton still fires on a programmatic click(), so refuse here
+        # too rather than relying on the widget being greyed out.
+        if self._locked_out:
+            return
         self._user_enabled = not self._user_enabled
         self._apply_state()
 
+    def _on_zoom(self):
+        if self._thread is None:
+            return
+        levels = LIVE_VIEW_ZOOM_LEVELS
+        next_level = levels[(levels.index(self._zoom_requested) + 1) % len(levels)]
+        if self._thread.request_zoom(next_level):
+            self._zoom_requested = next_level
+            # Readings taken at the other magnification describe a different image
+            # scale, so carrying them across would corrupt both the envelope and the
+            # bracketed minimum.
+            self._sharpness_envelope.clear()
+            self._focus_tracker.clear()
+            self._drift_tracker.clear()
+            self._update_zoom_button()
+            self._update_status_label()
+
+    def _update_zoom_button(self):
+        levels = LIVE_VIEW_ZOOM_LEVELS
+        next_level = levels[(levels.index(self._zoom_requested) + 1) % len(levels)]
+        self._zoom_btn.setText(f"Zoom {next_level}×")
+
     def closeEvent(self, event):
         self._poll_timer.stop()
+        # Put the exposure back before the thread goes: the settings written here were
+        # for previewing, and leaving the body on a solar shutter speed afterwards is a
+        # surprise with no visible cause.
+        if self._original_exposure is not None:
+            restore_exposure_settings(self._camera, self._original_exposure)
         if self._thread is not None:
+            # Blocks briefly: the worker drops out of live view on its way out, and
+            # letting it finish here is what keeps the camera teardown off a race.
             self._thread.stop()
             self._thread = None
+        self.closed.emit()
         event.accept()
 
 

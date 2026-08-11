@@ -2,11 +2,13 @@ import logging
 import csv
 from datetime import datetime, timedelta
 
+from apscheduler.events import EVENT_JOB_MISSED
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 from solareclipseworkbench import voice_prompt, take_picture, take_burst, take_bracket, take_hdr, sync_cameras, scripts, execute_command
 from solareclipseworkbench.camera import CameraSettings
+from solareclipseworkbench.shot_events import BUS, ShotEvent, ShotOutcome
 from solareclipseworkbench.gui import SolarEclipseController
 from solareclipseworkbench.solar_eclipse import get_solar_eclipses
 
@@ -83,6 +85,37 @@ def observe_solar_eclipse(ref_moments: dict, commands_filename: str, cameras: di
     return scheduler
 
 
+# What each scheduled job was, keyed by APScheduler job id: (camera, command,
+# description).  A missed job never reaches the camera code, so the event carries no
+# description of its own and the shot report would otherwise show it as anonymous.
+_JOB_META: dict[str, tuple[str, str, str]] = {}
+
+
+def _on_job_missed(event) -> None:
+    """Report an APScheduler misfire as a dropped shot.
+
+    Two things can kill a scheduled shot, and until now only one of them was visible.
+    _serialised_on_camera publishes a DROPPED event when the USB lock is busy, but a
+    job the scheduler cannot even start within its grace time is skipped inside
+    APScheduler -- no camera call, no event, no CSV row, just a log line.  A run could
+    therefore report every shot as fired while frames were quietly going missing.
+
+    Observability only: the grace time and the drop policy are unchanged.
+    """
+    camera_name, command, description = _JOB_META.get(event.job_id, ("", "unknown", ""))
+    BUS.publish(ShotEvent(
+        camera_name=camera_name,
+        command=command,
+        # Nothing ran, so there is no firing time to report; matching the two keeps
+        # drift_ms at zero rather than inventing a number.
+        scheduled_at=event.scheduled_run_time,
+        fired_at=event.scheduled_run_time,
+        outcome=ShotOutcome.DROPPED,
+        description=description,
+        detail="apscheduler misfire",
+    ))
+
+
 def start_scheduler():
     """ Start background scheduler and return it.
 
@@ -93,6 +126,8 @@ def start_scheduler():
     # inside _serialised_on_camera: if the USB lock is busy for more than
     # _MAX_LOCK_WAIT_S the shot is dropped rather than taken late.
     scheduler = BackgroundScheduler()
+    _JOB_META.clear()
+    scheduler.add_listener(_on_job_missed, EVENT_JOB_MISSED)
     scheduler.start()
 
     return scheduler
@@ -248,7 +283,15 @@ def schedule_command(scheduler: BackgroundScheduler, reference_moments: dict, cm
                               hour=execution_time.hour, minute=execution_time.minute,
                               second=execution_time.second, timezone=pytz.utc)
 
-        scheduler.add_job(func, trigger=trigger, args=args, name=description)
+        job = scheduler.add_job(func, trigger=trigger, args=args, name=description)
+        # Remembered here rather than looked up when a misfire fires: these are
+        # one-shot triggers, so by then the job is already out of the job store.
+        settings = next((a for a in args if isinstance(a, CameraSettings)), None)
+        _JOB_META[job.id] = (
+            settings.camera_name if settings else "",
+            getattr(func, "__name__", "unknown"),
+            description or "",
+        )
     except KeyError:
         return
 
