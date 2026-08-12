@@ -1,9 +1,10 @@
 # Eclipse Day — Field Checklist
 
 What to do, when to do it, and what to leave alone. Written around the
-`Total_Solar_Eclipse_2026_20260807.txt` script — 12 August 2026, Páramo de Poza
-de la Sal, Canon EOS 80D at 382 mm f/4.7 behind an ND5 solar filter. Every time
-below is read off that script; adapt the numbers for a different run.
+`Total_Solar_Eclipse_2026_20260811_almanza_terreno_privado.txt` script —
+12 August 2026, Almanza (private land), Canon EOS 80D at 382 mm f/4.7 behind an
+ND5 solar filter. Every time below is read off that script; adapt the numbers for
+a different run.
 
 Print this. The laptop shows the schedule, but you want paper in your pocket.
 
@@ -34,7 +35,7 @@ The jobs table in the workbench shows both — *Execution time (local)* and
 column in the field and never mix the two.
 
 The whole schedule hangs off your computer's clock. There is no mains power and
-probably no mobile data on the páramo, so NTP will not save you there:
+probably no mobile data at the site, so NTP will not save you there:
 
 - Sync the laptop clock over the internet **before you leave**.
 - On site, cross-check against GPS — [GPS from your phone](GPS_PHONE.md) or a USB
@@ -49,41 +50,43 @@ white frame.
 
 ## Reference moments for this run
 
-Computed for 42.67005° N, 3.57468° W, 1090 m. Magnitude 1.009, totality
-**1 min 34 s**.
+Computed for 42.66199° N, 5.03888° W, 920 m. Magnitude 1.016, totality
+**1 min 46 s**.
 
 | Moment | Local (CEST) | UTC | Sun alt | Sun az |
 |---|---|---|---|---|
-| C1 — first contact | **19:32:50** | 17:32:50 | 18.4° | 273° |
-| First partial frame (#1) | 19:33:00 | 17:33:00 | 18.4° | |
-| Last **filtered** frame (#50) | **20:26:42** | 18:26:42 | 8.6° | |
-| Pre-C2 beads burst (unfiltered) | 20:27:49 | 18:27:49 | 8.4° | |
-| C2 — totality begins | **20:27:57** | 18:27:57 | 8.4° | 282° |
-| HDR burst starts (MAX − 13 s) | 20:28:32 | 18:28:32 | 8.3° | |
-| MAX | 20:28:45 | 18:28:45 | 8.3° | 283° |
-| C3 — totality ends | **20:29:32** | 18:29:32 | 8.1° | 283° |
-| Post-C3 beads burst (unfiltered) | 20:29:40 | 18:29:40 | 8.1° | |
-| "Filters on" voice prompt | 20:29:52 | 18:29:52 | 8.1° | |
-| Last frame of the run (#45) | 21:14:53 | 19:14:53 | 0.1° | |
-| Sunset | 21:20:27 | 19:20:27 | — | 291° |
-| C4 | 21:21:12 | 19:21:12 | −1.0° | 291° |
+| C1 — first contact | **19:32:43** | 17:32:43 | 19.5° | 272° |
+| First partial frame (#1) | 19:32:54 | 17:32:54 | 19.5° | |
+| Last **filtered** frame (#50) | **20:26:53** | 18:26:53 | 9.7° | |
+| Pre-C2 beads burst (unfiltered) | 20:28:01 | 18:28:01 | 9.4° | |
+| C2 — totality begins | **20:28:09** | 18:28:09 | 9.4° | 281° |
+| HDR burst starts (MAX − 13 s) | 20:28:49 | 18:28:49 | 9.3° | |
+| MAX | 20:29:02 | 18:29:02 | 9.3° | 282° |
+| C3 — totality ends | **20:29:55** | 18:29:55 | 9.1° | 282° |
+| Post-C3 beads burst (unfiltered) | 20:30:03 | 18:30:03 | 9.1° | |
+| "Filters on" voice prompt | 20:30:15 | 18:30:15 | 9.0° | |
+| Last frame of the run (#50) | 21:20:37 | 19:20:37 | 0.1° | |
+| C4 | 21:21:49 | 19:21:49 | −0.1° | 290° |
+| Sunset | 21:26:16 | 19:26:16 | — | 291° |
 
-The sun sets 45 s *before* C4, which is why the script skips it. The run is
-1 h 42 m from C1 to the last frame, and fires roughly 165 frames (50 filtered
-partials, 45 more after C3, 23 totality singles, a 15-shot HDR, four one-second
-bursts, three at C1).
+C4 now falls 4 min 27 s *before* sunset, but the script still skips it: the
+computed altitude is −0.1° and anything below zero is dropped. The sun has not
+actually set at that point, so you may well see fourth contact by eye — there is
+simply nothing scheduled for it. The run is 1 h 48 m from C1 to the last frame,
+and fires roughly 176 frames (50 filtered partials, 50 more after C3, 30 totality
+singles, a 15-shot HDR, four one-second bursts, three at C1).
 
-**Scout your western horizon.** The sun tracks from azimuth 273° to 291° and
-drops from 18° to the horizon. Totality happens at only 8° altitude, so anything
-on the WNW skyline — a ridge, a treeline — eats the end of the sequence. Check
-this on a daylight visit, not at 20:00 on the day.
+**Scout your western horizon.** The sun tracks from azimuth 272° to 291° and
+drops from 19.5° to the horizon. Totality happens at only 9.4° altitude, so
+anything on the WNW skyline — a ridge, a treeline — eats the end of the sequence.
+Check this on a daylight visit, not at 20:00 on the day.
 
 ---
 
 ## The day before
 
 - [ ] Run the workbench once **with internet** so ephemeris and timing data are
-      downloaded and cached. It will not do this on the páramo.
+      downloaded and cached. It will not do this at the site.
 - [ ] Rehearse the whole script in simulation mode (`uv run sew -s`) so nothing
       about the sequence is new to you.
 - [ ] Sync the laptop clock.
@@ -93,7 +96,7 @@ this on a daylight visit, not at 20:00 on the day.
 - [ ] Format the card in the camera. ~5 GB of RAW is coming; give it far more.
 - [ ] Write the relaunch command on paper and tape it to the laptop:
 
-      sudo uv run sew -lat 42.67005 -lon -3.57468 -alt 1090 -d 2026-08-12
+      sudo uv run sew -lat 42.66199 -lon -5.03888 -alt 920 -d 2026-08-12
 
   **`-d` is the part that matters.** Opening a script reads the location from its
   `# Coordinates:` header, recomputes the contact times for it, and then locks
@@ -107,12 +110,12 @@ this on a daylight visit, not at 20:00 on the day.
   the whole line rather than working out which arguments you need in the dark.
 
 - [ ] Pack: solar viewing glasses, red torch, gaffer tape, spare USB cable,
-      tripod weight (it is an exposed plateau at 1090 m — it will be windy), and
-      a warm layer for the temperature drop.
+      tripod weight (open ground at 920 m — expect wind), and a warm layer for
+      the temperature drop.
 
 **Start the run on a fresh battery.** Swapping one mid-sequence drops the USB
 session and costs you a relaunch plus a re-detect. The tethered session with
-occasional live view will drain an 80D over 1 h 42 m, so a dummy battery on
+occasional live view will drain an 80D over 1 h 48 m, so a dummy battery on
 mains, if you have one, is the safer choice.
 
 ---
@@ -127,7 +130,7 @@ around the bursts by itself. Everything below it does *not* set for you:
 | Mode dial | **M** | The app warns if it is not, but fix it before it matters |
 | Lens switch | **MF** | Autofocus will hunt on a filtered sun and lose the shot |
 | Image stabiliser | **Off** | It fights the tripod |
-| Long-exposure noise reduction | **Off** | Non-negotiable — LENR doubles the time a frame occupies the camera, and the 2 s earthshine and 1 s corona frames would push everything after them into the missed pile |
+| Long-exposure noise reduction | **Off** | Non-negotiable — LENR doubles the time a frame occupies the camera, and the 1.6 s earthshine frames would push everything after them into the missed pile |
 | High-ISO noise reduction | Off | Same reason, smaller effect |
 | Image review | Off | Saves power and bus time |
 | Auto power-off | Disable | Stops the body sleeping during setup |
@@ -142,7 +145,7 @@ it.
 
 ## Setting up on site
 
-Work backwards from C1 at 19:32:50 local. Aim to have everything below finished
+Work backwards from C1 at 19:32:43 local. Aim to have everything below finished
 by **19:00**, which leaves half an hour of slack and time to just look at the
 sky.
 
@@ -156,10 +159,10 @@ sky.
 4. **Toolbar, left to right**: Location → Date → Reference moments → Camera(s).
    The relaunch command above pre-fills the first two.
 5. **Check the reference moments against the table on page one.** If C2 does not
-   read 20:27:57 local, stop and fix the location or the date before going
+   read 20:28:09 local, stop and fix the location or the date before going
    further.
 6. **Load the script.** Confirm the jobs table fills with photo jobs, not just
-   voice prompts, and that the first one counts down to 19:32:48.
+   voice prompts, and that the first one counts down to 19:32:41.
 7. **Baseline focus** — see below. Do this before C1, while you still have all
    the time in the world.
 
@@ -177,14 +180,14 @@ the camera-sync jobs either.
 
 | # | Window (local) | Window (UTC) | Sits between | Purpose |
 |---|---|---|---|---|
-| 1 | **before 19:32:30** | before 17:32:30 | — nothing scheduled yet | Establish critical focus |
-| 2 | **19:49:28 – 19:50:24** | 17:49:28 – 17:50:24 | frames #16 and #17 | First thermal-drift check |
-| 3 | **20:05:54 – 20:06:50** | 18:05:54 – 18:06:50 | frames #31 and #32 | Mid-partial check |
-| 4 | **20:23:26 – 20:24:22** | 18:23:26 – 18:24:22 | frames #47 and #48 | **Final focus** |
-| — | 20:24:32 – 20:25:28 | 18:24:32 – 18:25:28 | frames #48 and #49 | Fallback, confirm only |
+| 1 | **before 19:32:25** | before 17:32:25 | — nothing scheduled yet | Establish critical focus |
+| 2 | **19:49:29 – 19:50:25** | 17:49:29 – 17:50:25 | frames #16 and #17 | First thermal-drift check |
+| 3 | **20:06:00 – 20:06:56** | 18:06:00 – 18:06:56 | frames #31 and #32 | Mid-partial check |
+| 4 | **20:23:38 – 20:24:34** | 18:23:38 – 18:24:34 | frames #47 and #48 | **Final focus** |
+| — | 20:24:44 – 20:25:40 | 18:24:44 – 18:25:40 | frames #48 and #49 | Fallback, confirm only |
 
 **Window 1 — the real one.** Nothing is scheduled until the C1 − 2 s frame, so
-take as long as you need. The sun is at 18.4°, the highest it will be all
+take as long as you need. The sun is at 19.5°, the highest it will be all
 afternoon, which means the best seeing you will get. Use 10× live view on a
 sunspot or the solar limb. This is where focus is *set*; the rest are checks.
 
@@ -202,7 +205,7 @@ Then tape the focus ring and walk away.
 
 Two things shape this schedule:
 
-- **Do not chase focus late.** The sun falls from 18.4° at C1 to 8.4° at C2. By
+- **Do not chase focus late.** The sun falls from 19.5° at C1 to 9.4° at C2. By
   window 4 the image will be boiling in the low-altitude seeing, and live view
   will lie to you. Windows 2–4 exist to detect *thermal drift* against the focus
   you set in window 1 — small nudges only. If window 4 disagrees wildly with
@@ -220,7 +223,7 @@ There is no focus voice prompt in the workbench, only `filters_on`. **Set phone
 alarms for 19:49, 20:05 and 20:23 local.**
 
 One thing the app *does* give you free: the camera-sync jobs at 19:48, 20:03,
-20:17, 20:45, 21:00 and 21:14 local refresh battery and free-memory readings in
+20:18, 20:45, 20:59 and 21:15 local refresh battery and free-memory readings in
 the UI. Glance at the battery figure each time.
 
 ---
@@ -230,17 +233,17 @@ the UI. Glance at the battery figure each time.
 This is the highest-risk minute of the day. Rehearse the hand movements at home
 until they are automatic.
 
-**Filter off.** You have a 67-second window between the last filtered frame and
+**Filter off.** You have a 68-second window between the last filtered frame and
 the first unfiltered one:
 
 | Local | What |
 |---|---|
-| 20:25:57 | "C2 in 2 minutes" — get into position, hands ready, do not touch yet |
-| 20:26:42 | Frame #50 fires. **This is your cue.** It needs the filter on |
-| 20:26:45 – 20:27:00 | Filter off. Do it now, calmly |
-| 20:26:57 | "C2 in 60 seconds" — you should already be done |
-| 20:27:40 | Hands completely clear of the rig |
-| 20:27:49 | Pre-C2 beads burst fires unfiltered |
+| 20:26:09 | "C2 in 2 minutes" — get into position, hands ready, do not touch yet |
+| 20:26:53 | Frame #50 fires. **This is your cue.** It needs the filter on |
+| 20:26:56 – 20:27:11 | Filter off. Do it now, calmly |
+| 20:27:09 | "C2 in 60 seconds" — you should already be done |
+| 20:27:52 | Hands completely clear of the rig |
+| 20:28:01 | Pre-C2 beads burst fires unfiltered |
 
 Removing a **front-mounted** filter introduces no focus shift — it sits in
 collimated light. If yours lives in a rear filter drawer instead, it *will* shift
@@ -253,27 +256,28 @@ instead.
 
 | Local | What |
 |---|---|
-| 20:29:32 | C3. Totality is over |
-| 20:29:40 | Post-C3 beads burst fires — the last unfiltered frame |
-| 20:29:41 | **Filter on immediately.** Do not wait for the voice prompt |
-| 20:29:45 | Partial C3–C4 #1 fires — you will not have made it. See below |
-| 20:29:52 | "Filters on" voice prompt — a backstop, not your cue |
-| 20:30:46 | Partial C3–C4 #2 — this one should be clean |
+| 20:29:55 | C3. Totality is over |
+| 20:30:03 | Post-C3 beads burst fires — the last unfiltered frame |
+| 20:30:04 | **Filter on immediately.** Do not wait for the voice prompt |
+| 20:30:08 | Partial C3–C4 #1 fires — you will not have made it. See below |
+| 20:30:15 | "Filters on" voice prompt — a backstop, not your cue |
+| 20:31:09 | Partial C3–C4 #2 — this one should be clean |
 
-An unfiltered 382 mm lens on the sun is hard on the shutter even at 8° altitude.
+An unfiltered 382 mm lens on the sun is hard on the shutter even at 9° altitude.
 Getting the filter back on beats saving frame #1.
 
 ---
 
 ## Hands off: C2 − 25 s to C3 + 25 s
 
-From **20:27:33 to 20:29:57 local** the workbench locks live view out
+From **20:27:44 to 20:30:20 local** the workbench locks live view out
 deliberately — the filter is off and the mirror must stay down. That is also your
 own rule: do not touch the rig, do not chimp, do not adjust anything.
 
-Ninety-four seconds is not long. The script is firing 23 single frames, a
-15-shot HDR and two bursts in that time, and there is nothing you can usefully
-add. **Look at it with your own eyes.** That is what the automation is for.
+A hundred and six seconds is not long. The script is firing 30 unfiltered single
+frames, a 15-shot HDR and four bursts in that time, and there is nothing you can
+usefully add. **Look at it with your own eyes.** That is what the automation is
+for.
 
 ---
 
@@ -281,20 +285,22 @@ add. **Look at it with your own eyes.** That is what the automation is for.
 
 Do not react to any of these in the field.
 
-- **Partial C3–C4 #1 at 20:29:45 will be blown out.** It is scheduled 13 s after
+- **Partial C3–C4 #1 at 20:30:08 will be blown out.** It is scheduled 13 s after
   C3 at a filtered exposure, and no human gets the filter on that fast. One frame
-  out of 165. Ignore it.
+  out of ~176. Ignore it.
 - **The `Missed: N` counter will probably be non-zero after totality.** The
   corona sequence is spaced at 2 s, which is exactly the workbench's minimum for
-  normal mode, so the 80D may not keep up with every frame. Corona #10, about a
-  second after the HDR burst ends, is the most likely casualty. A shot that
+  normal mode, so the 80D may not keep up with every frame. Corona 3R #13, about
+  a second after the HDR burst ends, is the most likely casualty. A shot that
   cannot start within 1.5 s is skipped rather than fired late, which protects
   everything after it. There is nothing to fix mid-eclipse.
-- **The last few C3–C4 frames will be poor.** #45 fires at 0.1° altitude, five
-  minutes before sunset, through the whole thickness of the atmosphere. Refraction
-  and horizon haze, not focus, are what you are seeing.
-- **C4 is never photographed.** The sun is below the horizon by then, and the
-  script says so in its closing comment.
+- **The last few C3–C4 frames will be poor.** #50 fires at 0.1° altitude, five
+  and a half minutes before sunset, through the whole thickness of the
+  atmosphere. Refraction and horizon haze, not focus, are what you are seeing.
+- **C4 is never photographed.** Its computed altitude is −0.1°, so the script
+  drops it and says so in its closing comment. Unlike at a site further east, the
+  sun has not truly set by then — sunset is 4 min 27 s later — so fourth contact
+  is still yours to watch, just not to photograph.
 
 If something genuinely breaks — a crash, a camera that will not claim, a script
 that loads with no jobs — go straight to the
@@ -306,7 +312,7 @@ you lose only what was due while you were down.
 
 ## After the last frame
 
-The run ends at 21:14:53 local. Before you break anything down:
+The run ends at 21:20:37 local. Before you break anything down:
 
 - Leave the camera connected and the app running until you have confirmed the
   card has what you expect.
